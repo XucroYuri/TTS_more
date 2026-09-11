@@ -709,6 +709,7 @@ export default function App() {
     characters,
     projectCharacters,
     search: roleLibrarySearch,
+    onSaveCharacters: setCharacters,
     onSaveProjectCharacters: (nextProjectCharacters) => {
       setProject((current) => projectWithProjectCharacters(current, nextProjectCharacters));
     }
@@ -3554,8 +3555,7 @@ export default function App() {
                                       </select>
                                     </div>
                                     <div className="role-model-actions">
-                                      <button className="primary-button compact-button" onClick={bindActiveModelToProjectRole} disabled={!activeProjectCharacter}>{t("characters.bindToProjectRole")}</button>
-                                      <button className="secondary-button compact-button" onClick={writeActiveModelToLibrary} disabled={!activeProjectCharacter}>{t("characters.writeToLibrary")}</button>
+                                      <button className="primary-button compact-button" onClick={writeActiveModelToLibrary} disabled={!activeProjectCharacter}>{t("characters.bindToProjectRole")}</button>
                                       <button className="secondary-button compact-button" onClick={clearActiveProjectRoleBinding} disabled={!activeProjectCharacter?.project_binding}>{t("characters.clearProjectBinding")}</button>
                                     </div>
                                     <div className="role-detail-card">
@@ -4862,20 +4862,6 @@ export default function App() {
     } finally {
       setIsScanningModelCatalog(false);
     }
-  }
-
-  function bindActiveModelToProjectRole() {
-    if (!activeProjectCharacter || !activeModelCatalogItem) return;
-    const binding = gptSovitsProjectBindingFromModel(activeProjectCharacter.project_character_id, activeModelCatalogItem, activeModelSelectedSample);
-    setProject((current) => {
-      const nextProjectCharacters = ensureProjectCharacters(current, characters).map((item) =>
-        item.project_character_id === activeProjectCharacter.project_character_id
-          ? { ...item, project_binding: binding, match_status: item.match_status ?? "manual" }
-          : item
-      );
-      return projectWithProjectCharacters(current, nextProjectCharacters);
-    });
-    setNotice(t("notice.roleSaved"));
   }
 
   function clearActiveProjectRoleBinding() {

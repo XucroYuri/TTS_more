@@ -431,6 +431,34 @@ def test_fuzzy_folder_candidate_requires_confirmation_then_persists_role_mapping
     assert refreshed["requires_identity_confirmation"] is False
     assert refreshed["score_breakdown"]["character"] == 35
 
+    store.save_project(
+        "project-2",
+        ScriptProject(
+            title="second script",
+            project_characters=[
+                ProjectCharacter(
+                    project_character_id="new-jiao-bu",
+                    name="胶布",
+                    library_character_id=None,
+                    match_status="unmatched",
+                )
+            ],
+            lines=[
+                ScriptLine(
+                    id="line-2",
+                    character_id="new-jiao-bu",
+                    text="下一次也直接使用这个声音",
+                    language="zh",
+                )
+            ],
+        ),
+    )
+    reused = client.post("/api/projects/project-2/characters/rematch")
+    assert reused.status_code == 200
+    reused_mapping = reused.json()["project_characters"][0]
+    assert reused_mapping["library_character_id"] == payload["character"]["id"]
+    assert reused_mapping["match_status"] == "matched"
+
 
 def test_recommendation_returns_structured_catalog_unavailable_error(tmp_path: Path) -> None:
     data_root = tmp_path / "data"
