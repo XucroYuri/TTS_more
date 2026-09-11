@@ -5575,6 +5575,65 @@ def test_put_project_characters_syncs_active_parse_revision_project_binding(tmp_
     assert project_character["project_binding"]["binding_id"] == "role-1-project-gpt"
 
 
+def test_put_project_characters_preserves_confirmed_analysis_revision(tmp_path: Path) -> None:
+    client = TestClient(create_app(data_root=tmp_path))
+    original_character = {
+        "project_character_id": "role-1",
+        "name": "小品",
+        "library_character_id": None,
+        "mode": "reference",
+    }
+    response = client.put(
+        "/api/projects/demo",
+        json={
+            "title": "demo",
+            "default_language": "zh",
+            "active_script_revision_id": "script-r001",
+            "active_parse_revision_id": "semantic-revision-1",
+            "script_revisions": [
+                {"revision_id": "script-r001", "source_markdown": "小品：你好"}
+            ],
+            "parse_revisions": [
+                {
+                    "revision_id": "semantic-revision-1",
+                    "script_revision_id": "script-r001",
+                    "provider": "semantic-confirmed",
+                    "project_characters": [original_character],
+                    "lines": [
+                        {"id": "l001", "character_id": "role-1", "text": "你好"}
+                    ],
+                }
+            ],
+            "project_characters": [original_character],
+            "lines": [{"id": "l001", "character_id": "role-1", "text": "你好"}],
+        },
+    )
+    assert response.status_code == 200
+
+    update = client.put(
+        "/api/projects/demo/characters",
+        json={
+            "project_characters": [
+                {
+                    **original_character,
+                    "library_character_id": "xiao-pin",
+                    "match_confidence": 1.0,
+                    "match_status": "matched",
+                }
+            ]
+        },
+    )
+
+    assert update.status_code == 200
+    persisted = client.get("/api/projects/demo").json()
+    assert persisted["project_characters"][0]["library_character_id"] == "xiao-pin"
+    confirmed_snapshot = persisted["parse_revisions"][0]["project_characters"][0]
+    assert confirmed_snapshot["project_character_id"] == "role-1"
+    assert confirmed_snapshot["name"] == "小品"
+    assert confirmed_snapshot["library_character_id"] is None
+    assert confirmed_snapshot["match_status"] is None
+
+
 def test_generate_uses_line_temporary_binding_before_library_reference(tmp_path: Path) -> None:
     services_path = tmp_path / "services.json"
     services_path.write_text(

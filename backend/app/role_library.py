@@ -390,6 +390,23 @@ def resolve_project_characters(
     return output
 
 
+def sync_active_parse_project_characters(project: ScriptProject) -> None:
+    """Keep mutable parse snapshots in sync without rewriting confirmed analysis artifacts."""
+    active_parse = next(
+        (
+            item
+            for item in project.parse_revisions
+            if item.revision_id == project.active_parse_revision_id
+        ),
+        None,
+    )
+    if active_parse is None or active_parse.provider == "semantic-confirmed":
+        return
+    active_parse.project_characters = [
+        item.model_copy(deep=True) for item in project.project_characters
+    ]
+
+
 def _apply_project_binding(project_character: ProjectCharacter, character: Character) -> Character:
     binding = project_character.project_binding
     if binding is None:

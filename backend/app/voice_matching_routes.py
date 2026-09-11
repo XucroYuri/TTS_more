@@ -24,6 +24,7 @@ from .role_library import (
     match_project_characters,
     resolve_project_characters,
     slugify_role_name,
+    sync_active_parse_project_characters,
 )
 from .role_mapping_document import RoleMappingRule, load_role_mapping_document, upsert_role_mapping_document
 from .storage import ProjectStore
@@ -745,16 +746,7 @@ def build_voice_matching_router(
             for item in project.project_characters
             if item.project_character_id == project_character.project_character_id
         )
-        active_parse = next(
-            (
-                item
-                for item in project.parse_revisions
-                if item.revision_id == project.active_parse_revision_id
-            ),
-            None,
-        )
-        if active_parse is not None:
-            active_parse.project_characters = project.project_characters
+        sync_active_parse_project_characters(project)
         store.save_project(project_id, project)
         refreshed = _recommend_line(project, line_id, store, service)
         return {

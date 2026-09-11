@@ -78,6 +78,8 @@ export interface AnalysisDraftApi {
 export interface AnalysisControllerError {
   kind: "attach" | "create" | "poll" | "draft" | "patch" | "confirm" | "local";
   code: string | null;
+  httpStatus: number | null;
+  stage: string | null;
   message: string;
 }
 
@@ -137,7 +139,13 @@ function controllerError(
   error: unknown
 ): AnalysisControllerError {
   const parsed = parseAnalysisError(error);
-  return { kind, code: parsed.code, message: parsed.message };
+  return {
+    kind,
+    code: parsed.code,
+    httpStatus: parsed.status,
+    stage: parsed.stage,
+    message: parsed.message
+  };
 }
 
 function notFoundError(error: unknown): boolean {

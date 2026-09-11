@@ -167,7 +167,13 @@ export interface AnalysisBlockingDialogProps {
   kind: "run" | "conflict" | "controller";
   title: string;
   description: string;
-  error?: AnalysisError | null;
+  error?: AnalysisError | {
+    code: string | null;
+    http_status: number | null;
+    stage: string | null;
+    message: string;
+    trace_id?: string | null;
+  } | null;
   retryLabel?: string;
   onRetry?: () => void;
   onDismiss?: () => void;
@@ -203,9 +209,9 @@ export function AnalysisBlockingDialog({
 
         {error && detailsOpen ? (
           <dl className="analysis-error-dialog__diagnostics">
-            <div><dt>{t("analysis.errors.code")}</dt><dd>{error.code}</dd></div>
-            <div><dt>{t("analysis.errors.httpStatus")}</dt><dd>{error.http_status}</dd></div>
-            <div><dt>{t("analysis.errors.stage")}</dt><dd>{error.stage}</dd></div>
+            <div><dt>{t("analysis.errors.code")}</dt><dd>{error.code ?? t("analysis.common.none")}</dd></div>
+            <div><dt>{t("analysis.errors.httpStatus")}</dt><dd>{error.http_status ?? t("analysis.common.none")}</dd></div>
+            <div><dt>{t("analysis.errors.stage")}</dt><dd>{error.stage ?? t("analysis.common.none")}</dd></div>
             <div><dt>{t("analysis.errors.message")}</dt><dd>{error.message}</dd></div>
             <div>
               <dt>{t("analysis.errors.traceId")}</dt>

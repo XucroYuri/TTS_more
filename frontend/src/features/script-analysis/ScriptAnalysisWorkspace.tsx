@@ -409,9 +409,18 @@ export function ScriptAnalysisWorkspace({
           kind="controller"
           title={t("analysis.errors.controllerTitle")}
           description={t("analysis.errors.controllerDescription")}
+          error={{
+            code: controller.controllerError.code,
+            http_status: controller.controllerError.httpStatus,
+            stage: controller.controllerError.stage ?? controller.controllerError.kind,
+            message: controller.controllerError.message,
+            trace_id: null
+          }}
           onRetry={
             controller.controllerError.kind === "patch"
               ? controller.retryPendingOperations
+              : controller.controllerError.kind === "confirm"
+                ? handleConfirm
               : controller.retryAnalysis
           }
         />

@@ -1340,4 +1340,45 @@ describe("ScriptAnalysisWorkspace", () => {
     );
     expect(onConfirmed).toHaveBeenCalledWith(confirmedProject);
   });
+
+  it("shows confirmed recovery diagnostics and retries the failed confirmation directly", async () => {
+    const onConfirmed = vi.fn();
+    const view = await renderWorkspace(
+      draft({
+        confirmed_revision_id: "semantic-r8",
+        confirmed_parse_revision_id: "parse-r8",
+        confirmed_parse_fingerprint: "fingerprint-r8",
+        confirm_idempotency_key: "server-confirm-key"
+      }),
+      run(),
+      { onConfirmed }
+    );
+    view.confirm.mockRejectedValueOnce(
+      Object.assign(new Error("semantic request is invalid"), {
+        status: 422,
+        responseBody: JSON.stringify({
+          detail: {
+            code: "confirmed_artifact_mismatch",
+            message: "semantic request is invalid"
+          }
+        })
+      })
+    );
+
+    await click(view.container.querySelector('[data-action="confirm-recover"]')!);
+    await flushAsync();
+    const dialog = view.container.querySelector<HTMLElement>(
+      '[data-analysis-error="controller"]'
+    )!;
+    expect(dialog).not.toBeNull();
+    await click(dialog.querySelector('[data-error-action="details"]')!);
+    expect(dialog.textContent).toContain("confirmed_artifact_mismatch");
+    expect(dialog.textContent).toContain("422");
+    expect(dialog.textContent).toContain("confirm");
+
+    await click(dialog.querySelector('[data-error-action="retry"]')!);
+    await flushAsync();
+    expect(view.confirm).toHaveBeenCalledTimes(2);
+    expect(onConfirmed).toHaveBeenCalledWith(confirmedProject);
+  });
 });

@@ -36,7 +36,7 @@ from app.parser_config import ParserProviderUpdate, ParserProvidersUpdate, load_
 from app.queue import GenerationJobManager, ServiceGenerationQueue, build_cluster_key, persist_manifest_delta
 from app.resources import AUDIO_SUFFIXES, scan_reference_audio_groups
 from app.gpt_sovits_selection import training_task_from_weight
-from app.role_library import candidate_to_character, common_logs_presets, freeze_project_character, match_project_characters, referenced_projects, resolve_project_characters, scan_gpt_sovits_model_catalog_candidates, scan_logs_index_candidates, scan_logs_reference_audio_samples, scan_role_library_candidates
+from app.role_library import candidate_to_character, common_logs_presets, freeze_project_character, match_project_characters, referenced_projects, resolve_project_characters, scan_gpt_sovits_model_catalog_candidates, scan_logs_index_candidates, scan_logs_reference_audio_samples, scan_role_library_candidates, sync_active_parse_project_characters
 from app.role_mapping_document import RoleMappingRule, load_role_mapping_document, upsert_role_mapping_document
 from app.semantic_analysis import SemanticAnalysisService
 from app.semantic_executor import SemanticAnalysisExecutor
@@ -1080,12 +1080,7 @@ def create_app(
                     for item in project.project_characters
                     if item.project_character_id == request.project_character_id
                 )
-                active_parse = next(
-                    (item for item in project.parse_revisions if item.revision_id == project.active_parse_revision_id),
-                    None,
-                )
-                if active_parse is not None:
-                    active_parse.project_characters = project.project_characters
+                sync_active_parse_project_characters(project)
                 return linked
 
             _, project_character = store.update_project(request.project_id, link_imported_character)
@@ -1449,12 +1444,7 @@ def create_app(
     def put_project_characters(project_id: str, request: ProjectCharactersUpdate) -> dict[str, Any]:
         def apply_project_characters(project: ScriptProject) -> None:
             project.project_characters = request.project_characters
-            active_parse = next(
-                (item for item in project.parse_revisions if item.revision_id == project.active_parse_revision_id),
-                None,
-            )
-            if active_parse is not None:
-                active_parse.project_characters = project.project_characters
+            sync_active_parse_project_characters(project)
 
         try:
             project, _ = store.update_project(project_id, apply_project_characters)
@@ -1474,12 +1464,7 @@ def create_app(
                 force=True,
                 role_mappings=role_mappings,
             )
-            active_parse = next(
-                (item for item in project.parse_revisions if item.revision_id == project.active_parse_revision_id),
-                None,
-            )
-            if active_parse is not None:
-                active_parse.project_characters = project.project_characters
+            sync_active_parse_project_characters(project)
 
         try:
             project, _ = store.update_project(project_id, rematch)
