@@ -317,7 +317,7 @@ def match_project_characters(
     by_name = _library_lookup(
         [character for character in library if character.library_status == "confirmed"]
     )
-    document_mappings = _role_mapping_lookup(role_mappings or [], by_id, by_name)
+    document_mappings = _role_mapping_lookup(role_mappings or [], by_name)
     existing_by_id = {item.project_character_id: item for item in project.project_characters}
     existing_by_name = {_normalize(item.name): item for item in project.project_characters}
     for line in project.lines:
@@ -749,17 +749,23 @@ def _library_lookup(library: list[Character]) -> dict[str, Character]:
 
 def _role_mapping_lookup(
     rules: list[RoleMappingRule],
-    by_id: dict[str, Character],
     by_name: dict[str, Character],
 ) -> dict[str, tuple[RoleMappingRule, Character | None]]:
     lookup: dict[str, tuple[RoleMappingRule, Character | None]] = {}
     for rule in rules:
-        character = None
-        if rule.enabled:
-            character = by_id.get(rule.library_character_id) or by_name.get(
-                _normalize(rule.library_character_name)
-            )
-        lookup[_normalize(rule.script_role_name)] = (rule, character)
+        # An explicitly edited alias can point the canonical script role at a
+        # differently named library entry, so aliases take precedence here.
+        identities = [*rule.aliases, rule.script_role_name]
+        character = next(
+            (
+                matched
+                for value in identities
+                if (matched := by_name.get(_normalize(value))) is not None
+            ),
+            None,
+        )
+        for value in identities:
+            lookup[_normalize(value)] = (rule, character)
     return lookup
 
 

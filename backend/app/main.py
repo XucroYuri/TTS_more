@@ -1053,9 +1053,7 @@ def create_app(
                 store.role_mapping_path(),
                 RoleMappingRule(
                     script_role_name=project_character.name,
-                    library_character_id=character.id,
-                    library_character_name=character.name,
-                    notes="在角色库导入时确认",
+                    aliases=(character.name,),
                 ),
             )
 

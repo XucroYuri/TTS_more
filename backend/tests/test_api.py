@@ -5237,17 +5237,17 @@ def test_project_character_rematch_rereads_markdown_mapping(tmp_path: Path) -> N
     )
     mapping_path = client.app.state.store.role_mapping_path()
     mapping_path.write_text(
-        "| 剧本角色名 | 角色库角色 ID | 角色库角色名称 | 启用 | 备注 |\n"
-        "| --- | --- | --- | --- | --- |\n"
-        "| 幽灵 | voice-a | 音色 A | 是 | |\n",
+        "| 剧本角色名 | 别名 |\n"
+        "| --- | --- |\n"
+        "| 幽灵 | 音色 A |\n",
         encoding="utf-8",
     )
 
     first = client.post("/api/projects/demo/characters/rematch").json()["project_characters"][0]
     mapping_path.write_text(
-        "| 剧本角色名 | 角色库角色 ID | 角色库角色名称 | 启用 | 备注 |\n"
-        "| --- | --- | --- | --- | --- |\n"
-        "| 幽灵 | voice-b | 音色 B | 是 | |\n",
+        "| 剧本角色名 | 别名 |\n"
+        "| --- | --- |\n"
+        "| 幽灵 | 音色 B |\n",
         encoding="utf-8",
     )
     second = client.post("/api/projects/demo/characters/rematch").json()["project_characters"][0]

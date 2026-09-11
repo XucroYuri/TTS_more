@@ -721,9 +721,7 @@ def build_voice_matching_router(
             store.role_mapping_path(),
             RoleMappingRule(
                 script_role_name=project_character.name,
-                library_character_id=character.id,
-                library_character_name=character.name,
-                notes="在推荐音色确认时写入",
+                aliases=(character.name,),
             ),
         )
 

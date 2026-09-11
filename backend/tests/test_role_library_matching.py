@@ -62,7 +62,7 @@ def test_force_rematch_only_links_library_role_without_renaming_script_role() ->
     assert mappings[0].name == "幽灵"
 
 
-def test_markdown_mapping_overrides_existing_link_and_can_disable_matching() -> None:
+def test_markdown_role_alias_overrides_existing_link() -> None:
     library = [
         Character(id="old-voice", name="旧音色", aliases=["幽灵"], library_status="confirmed"),
         Character(id="new-voice", name="新音色", library_status="confirmed"),
@@ -84,19 +84,11 @@ def test_markdown_mapping_overrides_existing_link_and_can_disable_matching() -> 
         project,
         library,
         force=True,
-        role_mappings=[RoleMappingRule("幽灵", "new-voice", "新音色")],
-    )
-    disabled = match_project_characters(
-        project,
-        library,
-        force=True,
-        role_mappings=[RoleMappingRule("幽灵", enabled=False)],
+        role_mappings=[RoleMappingRule("幽灵", ("新音色",))],
     )
 
     assert remapped[0].library_character_id == "new-voice"
     assert remapped[0].name == "幽灵"
-    assert disabled[0].library_character_id is None
-    assert disabled[0].match_status == "unmatched"
 
 
 def test_unmatched_project_character_resolves_without_default_tts_profile() -> None:
