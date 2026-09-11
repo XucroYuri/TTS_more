@@ -3,6 +3,10 @@
   min-width: 0;
 }
 
+.filters-row:has(.line-queue-menu[open]) {
+  z-index: 20;
+}
+
 .line-queue-menu > summary {
   display: inline-flex;
   align-items: center;
