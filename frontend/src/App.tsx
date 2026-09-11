@@ -65,6 +65,7 @@ import {
   reloadServiceSettings,
   recommendVoices,
   referenceAudioUrl,
+  rematchProjectCharacters,
   runRealValidation,
   saveCharacters,
   saveParserProviders,
@@ -1331,14 +1332,45 @@ export default function App() {
     }
   }
 
-  function refreshActiveVoiceRecommendation() {
+  async function refreshActiveVoiceRecommendation() {
     const projectId = currentProjectId;
     const lineId = activeLine?.id;
     const catalogVersion = voiceCatalog?.catalog_version;
     if (!projectId || !lineId || !catalogVersion) return;
-    voiceRecommendationCacheRef.current.delete(`${projectId}|${lineId}|${catalogVersion}`);
+    const cacheKey = `${projectId}|${lineId}|${catalogVersion}`;
+    setVoiceRecommendationLoadingLineId(lineId);
     setVoiceRecommendationError(null);
-    setVoiceRecommendationEpoch((current) => current + 1);
+    try {
+      await flushPendingProjectAutosave(projectId);
+      await rematchProjectCharacters(projectId);
+      const authoritativeProject = await fetchProject(projectId);
+      if (currentProjectIdRef.current !== projectId) return;
+      markWorkspaceAuthoritative(projectId, authoritativeProject, charactersRef.current);
+      setProject(authoritativeProject);
+
+      voiceRecommendationCacheRef.current.delete(cacheKey);
+      const requestToken = voiceRecommendationRequestTokenRef.current + 1;
+      voiceRecommendationRequestTokenRef.current = requestToken;
+      const payload = await recommendVoices(projectId, [lineId]);
+      if (
+        currentProjectIdRef.current !== projectId
+        || voiceRecommendationRequestTokenRef.current !== requestToken
+      ) return;
+      const recommendation = payload.recommendations.find((item) => item.line_id === lineId);
+      if (recommendation) {
+        setVoiceRecommendations((current) => ({ ...current, [lineId]: recommendation }));
+      }
+      voiceRecommendationCacheRef.current.add(cacheKey);
+    } catch (error) {
+      voiceRecommendationCacheRef.current.delete(cacheKey);
+      if (currentProjectIdRef.current === projectId) {
+        setVoiceRecommendationError(error instanceof Error ? error.message : t("voiceMatching.recommendationFailed"));
+      }
+    } finally {
+      if (currentProjectIdRef.current === projectId) {
+        setVoiceRecommendationLoadingLineId(null);
+      }
+    }
   }
 
   async function chooseVoiceCandidate(candidateId: string) {
