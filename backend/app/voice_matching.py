@@ -91,14 +91,9 @@ def rank_voice_candidates(
     for resource in catalog.resources:
         if not resource.supports_dynamic_weights:
             continue
+        references_by_task = _dynamic_references_by_task(catalog, resource)
         for weight_pair in pair_dynamic_weights(catalog, resource):
-            for asset in catalog.reference_assets:
-                if (
-                    asset.reference_asset_id not in resource.reference_asset_ids
-                    or asset.training_task != weight_pair.training_task
-                    or not asset.prompt_text.strip()
-                ):
-                    continue
+            for asset in references_by_task.get(weight_pair.training_task, ()):
                 pair = (resource, asset)
                 if _passes_identity_gates(request, pair, ambiguous_names):
                     eligible.append((resource, asset, weight_pair))
@@ -142,18 +137,14 @@ def rank_fuzzy_folder_candidates(
     for resource in catalog.resources:
         if resource.state != "ready" or not resource.supports_dynamic_weights:
             continue
+        references_by_task = _dynamic_references_by_task(catalog, resource)
         for weight_pair in pair_dynamic_weights(catalog, resource):
             if not _folder_fuzzy_matches(weight_pair.training_task, identity_tokens):
                 continue
-            for asset in catalog.reference_assets:
+            for asset in references_by_task.get(weight_pair.training_task, ()):
                 if (
-                    asset.reference_asset_id not in resource.reference_asset_ids
-                    or asset.training_task != weight_pair.training_task
-                    or not asset.prompt_text.strip()
-                    or (
-                        asset.emotion_origin == "inferred"
-                        and asset.emotion_confidence < 0.75
-                    )
+                    asset.emotion_origin == "inferred"
+                    and asset.emotion_confidence < 0.75
                 ):
                     continue
                 eligible.append((resource, asset, weight_pair))
@@ -177,6 +168,23 @@ def rank_fuzzy_folder_candidates(
         candidates=scored[:3],
         blockers=[] if scored else [classify_empty_recommendation(request, catalog)],
     )
+
+
+def _dynamic_references_by_task(
+    catalog: CatalogSnapshot,
+    resource: VoiceResourceRecord,
+) -> dict[str, list[ReferenceAssetRecord]]:
+    reference_ids = set(resource.reference_asset_ids)
+    references_by_task: dict[str, list[ReferenceAssetRecord]] = {}
+    for asset in catalog.reference_assets:
+        if (
+            asset.reference_asset_id not in reference_ids
+            or not asset.training_task
+            or not asset.prompt_text.strip()
+        ):
+            continue
+        references_by_task.setdefault(asset.training_task, []).append(asset)
+    return references_by_task
 
 
 def _fuzzy_identity_tokens(values: Sequence[str]) -> set[str]:
