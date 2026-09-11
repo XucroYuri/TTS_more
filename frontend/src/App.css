@@ -5448,7 +5448,7 @@ h3 {
 
 .line-primary-row {
   display: grid;
-  grid-template-columns: 18px minmax(82px, 0.15fr) minmax(0, 1fr) auto;
+  grid-template-columns: minmax(82px, 0.15fr) minmax(0, 1fr) auto;
   gap: 7px;
   align-items: center;
 }
@@ -7365,7 +7365,7 @@ h3 {
   }
 
   .line-primary-row {
-    grid-template-columns: 20px minmax(86px, 0.22fr) minmax(0, 1fr) auto;
+    grid-template-columns: minmax(86px, 0.22fr) minmax(0, 1fr) auto;
   }
 
   .line-copy {
@@ -7873,7 +7873,7 @@ h3 {
   }
 
   .line-primary-row {
-    grid-template-columns: 18px minmax(72px, 0.28fr) minmax(0, 1fr) auto;
+    grid-template-columns: minmax(72px, 0.28fr) minmax(0, 1fr) auto;
   }
 
   .line-copy {
