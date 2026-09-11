@@ -30,7 +30,35 @@ def test_project_character_matching_uses_aliases_nicknames_and_match_names() -> 
     mappings = match_project_characters(project, library)
 
     assert [item.library_character_id for item in mappings] == ["hero", "mentor"]
-    assert [item.name for item in mappings] == ["主角", "导师"]
+    assert [item.name for item in mappings] == ["队长", "顾问"]
+
+
+def test_force_rematch_only_links_library_role_without_renaming_script_role() -> None:
+    library = [
+        Character(
+            id="xin-chen-t-t-s",
+            name="心辰TTS",
+            aliases=["幽灵"],
+            library_status="confirmed",
+        )
+    ]
+    project = ScriptProject(
+        title="demo",
+        project_characters=[
+            {
+                "project_character_id": "semantic-role-ghost",
+                "name": "幽灵",
+                "library_character_id": None,
+                "mode": "reference",
+            }
+        ],
+        lines=[ScriptLine(id="l001", character_id="semantic-role-ghost", text="快跑！")],
+    )
+
+    mappings = match_project_characters(project, library, force=True)
+
+    assert mappings[0].library_character_id == "xin-chen-t-t-s"
+    assert mappings[0].name == "幽灵"
 
 
 def test_unmatched_project_character_resolves_without_default_tts_profile() -> None:

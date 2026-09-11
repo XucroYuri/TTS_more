@@ -2776,7 +2776,7 @@ def test_create_parse_revision_matches_project_characters_to_library(tmp_path: P
     mapping = payload["revision"]["project_characters"][0]
     assert mapping["project_character_id"] == payload["project"]["lines"][0]["character_id"]
     assert mapping["library_character_id"] == "zhu-jue"
-    assert mapping["name"] == "主角"
+    assert mapping["name"] == "队长"
     assert mapping["match_status"] == "matched"
     assert payload["project"]["project_characters"][0]["library_character_id"] == "zhu-jue"
 
@@ -5212,7 +5212,7 @@ def test_project_character_rematch_uses_existing_display_names(tmp_path: Path) -
     mapping = response.json()["project_characters"][0]
     assert mapping["project_character_id"] == "xiaoguang"
     assert mapping["library_character_id"] == "zhu-jue"
-    assert mapping["name"] == "主角"
+    assert mapping["name"] == "队长"
     assert response.json()["characters"][0]["profiles"][0]["bindings"][0]["config"]["logs_name"] == "demo-hero-logs"
 
 

@@ -324,15 +324,13 @@ def match_project_characters(project: ScriptProject, library: list[Character], f
             if existing and existing.library_character_id
             else None
         ) or by_name.get(_normalize(display_name)) or by_name.get(_normalize(line.character_id))
-        matched_name = (
-            display_name
-            if character and existing and existing.library_character_id == character.id
-            else character.name if character else display_name
-        )
         output.append(
             ProjectCharacter(
                 project_character_id=line.character_id,
-                name=matched_name,
+                # Matching only links the analyzed script role to a library role.
+                # The analyzed display name belongs to the script and must not be
+                # replaced by the library folder/role name after a fuzzy match.
+                name=display_name,
                 library_character_id=character.id if character else None,
                 mode=ProjectCharacterMode.REFERENCE,
                 project_binding=existing.project_binding if existing else None,
