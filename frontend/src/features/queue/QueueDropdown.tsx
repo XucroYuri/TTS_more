@@ -44,7 +44,7 @@ export function QueueDropdown({ jobs, currentProjectId, lineLabels }: QueueDropd
                 <article className="line-queue-item" key={`${job.job_id}:${item.task_id}`}>
                   <div className="line-queue-item-head">
                     <strong title={label}>{label}</strong>
-                    <span className={`status-pill tone-${generationStatusTone(item.status)}`}>{t(generationStatusKey(item.status))}</span>
+                    <span className={`status-pill tone-${generationStatusTone(item.status)} status-${item.status}`}>{t(generationStatusKey(item.status))}</span>
                     <b>{progress}%</b>
                   </div>
                   <div className="line-queue-progress" aria-label={t("queue.progressLabel", { percent: progress })}>

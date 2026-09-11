@@ -99,6 +99,25 @@
   font-size: 12px;
 }
 
+.line-queue-item .status-pill.status-completed {
+  color: #107d32;
+  background: var(--geist-green-100);
+}
+
+.line-queue-item .status-pill.status-loading,
+.line-queue-item .status-pill.status-running,
+.line-queue-item .status-pill.status-finalizing {
+  color: #946200;
+  background: var(--geist-amber-100);
+}
+
+.line-queue-item .status-pill.status-failed,
+.line-queue-item .status-pill.status-cancelling,
+.line-queue-item .status-pill.status-cancelled {
+  color: var(--geist-red-800);
+  background: var(--geist-red-100);
+}
+
 .line-queue-progress {
   height: 4px;
   overflow: hidden;
