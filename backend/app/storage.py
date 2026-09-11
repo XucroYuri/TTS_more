@@ -17,6 +17,7 @@ import yaml
 from pydantic import BaseModel
 
 from app.models import Character, GenerationManifest, ParseRevision, ScriptProject
+from app.role_mapping_document import ROLE_MAPPING_FILENAME
 from app.path_safety import (
     WINDOWS_RESERVED_NAMES,
     encode_windows_component,
@@ -191,6 +192,12 @@ class ProjectStore:
 
     def writable_characters_path(self) -> Path:
         return self._resolve_characters_paths()[1]
+
+    def role_mapping_path(self) -> Path:
+        # Production keeps data under <workstation>/data, while isolated tests
+        # use an arbitrary temporary data root.
+        base = self.root.parent if self.root.name.casefold() == "data" else self.root
+        return base / ROLE_MAPPING_FILENAME
 
     def save_project(self, project_id: str, project: ScriptProject) -> None:
         safe_id = self._safe_project_id(project_id)

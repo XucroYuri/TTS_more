@@ -37,6 +37,7 @@ from app.queue import GenerationJobManager, ServiceGenerationQueue, build_cluste
 from app.resources import AUDIO_SUFFIXES, scan_reference_audio_groups
 from app.gpt_sovits_selection import training_task_from_weight
 from app.role_library import candidate_to_character, common_logs_presets, freeze_project_character, match_project_characters, referenced_projects, resolve_project_characters, scan_gpt_sovits_model_catalog_candidates, scan_logs_index_candidates, scan_logs_reference_audio_samples, scan_role_library_candidates
+from app.role_mapping_document import RoleMappingRule, load_role_mapping_document, upsert_role_mapping_document
 from app.semantic_analysis import SemanticAnalysisService
 from app.semantic_executor import SemanticAnalysisExecutor
 from app.semantic_logging import semantic_event_logger
@@ -1047,6 +1048,17 @@ def create_app(
         characters.append(character)
         store.save_characters(characters)
 
+        if project_character is not None:
+            upsert_role_mapping_document(
+                store.role_mapping_path(),
+                RoleMappingRule(
+                    script_role_name=project_character.name,
+                    library_character_id=character.id,
+                    library_character_name=character.name,
+                    notes="在角色库导入时确认",
+                ),
+            )
+
         if target_project is not None and project_character is not None:
             def link_imported_character(project: ScriptProject) -> ProjectCharacter:
                 linked: ProjectCharacter | None = None
@@ -1300,7 +1312,12 @@ def create_app(
                 deep=True,
                 update={"project_characters": project_characters, "lines": lines},
             )
-            project_characters = match_project_characters(draft_project, store.load_characters(), force=True)
+            project_characters = match_project_characters(
+                draft_project,
+                store.load_characters(),
+                force=True,
+                role_mappings=load_role_mapping_document(store.role_mapping_path()),
+            )
             revision = ParseRevision(
                 revision_id=revision_id,
                 script_revision_id=latest_script_revision.revision_id,
@@ -1408,14 +1425,26 @@ def create_app(
     @app.get("/api/projects/{project_id}/characters")
     def get_project_characters(project_id: str) -> dict[str, Any]:
         library = store.load_characters()
+        role_mappings = load_role_mapping_document(store.role_mapping_path())
         try:
             project = store.load_project(project_id).model_copy(deep=True)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail="project not found") from exc
-        project.project_characters = match_project_characters(project, library)
+        project.project_characters = match_project_characters(
+            project,
+            library,
+            role_mappings=role_mappings,
+        )
         return {
             "project_characters": [item.model_dump(mode="json") for item in project.project_characters],
-            "characters": [character.model_dump(mode="json") for character in resolve_project_characters(project, library)],
+            "characters": [
+                character.model_dump(mode="json")
+                for character in resolve_project_characters(
+                    project,
+                    library,
+                    role_mappings=role_mappings,
+                )
+            ],
         }
 
     @app.put("/api/projects/{project_id}/characters")
@@ -1438,9 +1467,15 @@ def create_app(
     @app.post("/api/projects/{project_id}/characters/rematch")
     def rematch_project_characters(project_id: str) -> dict[str, Any]:
         library = store.load_characters()
+        role_mappings = load_role_mapping_document(store.role_mapping_path())
 
         def rematch(project: ScriptProject) -> None:
-            project.project_characters = match_project_characters(project, library, force=True)
+            project.project_characters = match_project_characters(
+                project,
+                library,
+                force=True,
+                role_mappings=role_mappings,
+            )
             active_parse = next(
                 (item for item in project.parse_revisions if item.revision_id == project.active_parse_revision_id),
                 None,
@@ -1454,15 +1489,28 @@ def create_app(
             raise HTTPException(status_code=404, detail="project not found") from exc
         return {
             "project_characters": [item.model_dump(mode="json") for item in project.project_characters],
-            "characters": [character.model_dump(mode="json") for character in resolve_project_characters(project, library)],
+            "characters": [
+                character.model_dump(mode="json")
+                for character in resolve_project_characters(
+                    project,
+                    library,
+                    role_mappings=role_mappings,
+                )
+            ],
         }
 
     @app.post("/api/projects/{project_id}/characters/{project_character_id}/freeze")
     def freeze_character(project_id: str, project_character_id: str) -> dict[str, Any]:
         library = store.load_characters()
+        role_mappings = load_role_mapping_document(store.role_mapping_path())
 
         def freeze(project: ScriptProject) -> ProjectCharacter:
-            return freeze_project_character(project, project_character_id, library)
+            return freeze_project_character(
+                project,
+                project_character_id,
+                library,
+                role_mappings=role_mappings,
+            )
 
         try:
             _, project_character = store.update_project(project_id, freeze)
@@ -2396,7 +2444,11 @@ def _enrich_tasks_for_project(
         project = store.load_project(project_id)
     except FileNotFoundError:
         return tasks
-    characters = resolve_project_characters(project, store.load_characters())
+    characters = resolve_project_characters(
+        project,
+        store.load_characters(),
+        role_mappings=load_role_mapping_document(store.role_mapping_path()),
+    )
     by_id = {character.id: character for character in characters}
     project_lines = {line.id: line for line in project.lines}
     output: list[GenerationTask] = []

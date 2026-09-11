@@ -25,6 +25,7 @@ from .role_library import (
     resolve_project_characters,
     slugify_role_name,
 )
+from .role_mapping_document import RoleMappingRule, load_role_mapping_document, upsert_role_mapping_document
 from .storage import ProjectStore
 from .voice_catalog import (
     ReferenceMetadataOverride,
@@ -86,7 +87,12 @@ def _line_and_character(
     if line is None:
         raise HTTPException(status_code=404, detail="line not found")
     library = store.load_characters()
-    mappings = match_project_characters(project, library)
+    role_mappings = load_role_mapping_document(store.role_mapping_path())
+    mappings = match_project_characters(
+        project,
+        library,
+        role_mappings=role_mappings,
+    )
     mapping = next(
         (item for item in mappings if item.project_character_id == line.character_id),
         None,
@@ -103,7 +109,11 @@ def _line_and_character(
     )
     if not has_snapshot and not has_library_character:
         return line, None
-    characters = resolve_project_characters(project, library)
+    characters = resolve_project_characters(
+        project,
+        library,
+        role_mappings=role_mappings,
+    )
     character = next((item for item in characters if item.id == line.character_id), None)
     return line, character
 
@@ -707,6 +717,15 @@ def build_voice_matching_router(
         characters = [item for item in existing_characters if item.id != character.id]
         characters.append(character)
         store.save_characters(characters)
+        upsert_role_mapping_document(
+            store.role_mapping_path(),
+            RoleMappingRule(
+                script_role_name=project_character.name,
+                library_character_id=character.id,
+                library_character_name=character.name,
+                notes="在推荐音色确认时写入",
+            ),
+        )
 
         project.project_characters = [
             item.model_copy(

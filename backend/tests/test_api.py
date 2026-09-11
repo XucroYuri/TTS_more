@@ -5216,6 +5216,47 @@ def test_project_character_rematch_uses_existing_display_names(tmp_path: Path) -
     assert response.json()["characters"][0]["profiles"][0]["bindings"][0]["config"]["logs_name"] == "demo-hero-logs"
 
 
+def test_project_character_rematch_rereads_markdown_mapping(tmp_path: Path) -> None:
+    client = TestClient(create_app(data_root=tmp_path))
+    client.put(
+        "/api/characters",
+        json=[
+            {"id": "voice-a", "name": "音色 A", "library_status": "confirmed"},
+            {"id": "voice-b", "name": "音色 B", "library_status": "confirmed"},
+        ],
+    )
+    client.put(
+        "/api/projects/demo",
+        json={
+            "title": "demo",
+            "project_characters": [
+                {"project_character_id": "ghost", "name": "幽灵", "mode": "reference"}
+            ],
+            "lines": [{"id": "l001", "character_id": "ghost", "text": "快跑！"}],
+        },
+    )
+    mapping_path = client.app.state.store.role_mapping_path()
+    mapping_path.write_text(
+        "| 剧本角色名 | 角色库角色 ID | 角色库角色名称 | 启用 | 备注 |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "| 幽灵 | voice-a | 音色 A | 是 | |\n",
+        encoding="utf-8",
+    )
+
+    first = client.post("/api/projects/demo/characters/rematch").json()["project_characters"][0]
+    mapping_path.write_text(
+        "| 剧本角色名 | 角色库角色 ID | 角色库角色名称 | 启用 | 备注 |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "| 幽灵 | voice-b | 音色 B | 是 | |\n",
+        encoding="utf-8",
+    )
+    second = client.post("/api/projects/demo/characters/rematch").json()["project_characters"][0]
+
+    assert first["library_character_id"] == "voice-a"
+    assert second["library_character_id"] == "voice-b"
+    assert second["name"] == "幽灵"
+
+
 def test_generate_enriches_tasks_from_project_character_reference(tmp_path: Path) -> None:
     services_path = tmp_path / "services.json"
     services_path.write_text(

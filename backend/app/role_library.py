@@ -19,6 +19,7 @@ from app.models import (
     VoiceProfile,
 )
 from app.resources import AUDIO_SUFFIXES, GPT_WEIGHT_SUFFIXES, SOVITS_WEIGHT_SUFFIXES
+from app.role_mapping_document import RoleMappingRule
 
 
 TEXT_SUFFIXES = [".txt", ".lab", ".json"]
@@ -302,7 +303,12 @@ def candidate_to_character(candidate: dict[str, Any]) -> Character:
     )
 
 
-def match_project_characters(project: ScriptProject, library: list[Character], force: bool = False) -> list[ProjectCharacter]:
+def match_project_characters(
+    project: ScriptProject,
+    library: list[Character],
+    force: bool = False,
+    role_mappings: list[RoleMappingRule] | None = None,
+) -> list[ProjectCharacter]:
     if project.project_characters and not force:
         return project.project_characters
     output: list[ProjectCharacter] = []
@@ -311,6 +317,7 @@ def match_project_characters(project: ScriptProject, library: list[Character], f
     by_name = _library_lookup(
         [character for character in library if character.library_status == "confirmed"]
     )
+    document_mappings = _role_mapping_lookup(role_mappings or [], by_id, by_name)
     existing_by_id = {item.project_character_id: item for item in project.project_characters}
     existing_by_name = {_normalize(item.name): item for item in project.project_characters}
     for line in project.lines:
@@ -319,11 +326,20 @@ def match_project_characters(project: ScriptProject, library: list[Character], f
         seen.add(line.character_id)
         existing = existing_by_id.get(line.character_id) or existing_by_name.get(_normalize(line.character_id))
         display_name = existing.name if existing else line.character_id
-        character = (
-            by_id.get(existing.library_character_id or "")
-            if existing and existing.library_character_id
-            else None
-        ) or by_name.get(_normalize(display_name)) or by_name.get(_normalize(line.character_id))
+        document_rule, document_character = _document_mapping_for_role(
+            document_mappings,
+            display_name,
+            line.character_id,
+        )
+        character = document_character if document_rule else (
+            (
+                by_id.get(existing.library_character_id or "")
+                if existing and existing.library_character_id
+                else None
+            )
+            or by_name.get(_normalize(display_name))
+            or by_name.get(_normalize(line.character_id))
+        )
         output.append(
             ProjectCharacter(
                 project_character_id=line.character_id,
@@ -341,10 +357,14 @@ def match_project_characters(project: ScriptProject, library: list[Character], f
     return output
 
 
-def resolve_project_characters(project: ScriptProject, library: list[Character]) -> list[Character]:
+def resolve_project_characters(
+    project: ScriptProject,
+    library: list[Character],
+    role_mappings: list[RoleMappingRule] | None = None,
+) -> list[Character]:
     output: list[Character] = []
     by_id = {character.id: character for character in library}
-    mappings = match_project_characters(project, library)
+    mappings = match_project_characters(project, library, role_mappings=role_mappings)
     for item in mappings:
         source: Character | None = None
         if item.mode == ProjectCharacterMode.SNAPSHOT and item.character_snapshot:
@@ -395,8 +415,13 @@ def _apply_project_binding(project_character: ProjectCharacter, character: Chara
     )
 
 
-def freeze_project_character(project: ScriptProject, project_character_id: str, library: list[Character]) -> ProjectCharacter:
-    mappings = match_project_characters(project, library)
+def freeze_project_character(
+    project: ScriptProject,
+    project_character_id: str,
+    library: list[Character],
+    role_mappings: list[RoleMappingRule] | None = None,
+) -> ProjectCharacter:
+    mappings = match_project_characters(project, library, role_mappings=role_mappings)
     by_id = {character.id: character for character in library}
     target: ProjectCharacter | None = None
     for item in mappings:
@@ -720,6 +745,32 @@ def _library_lookup(library: list[Character]) -> dict[str, Character]:
         for value in _character_match_values(character):
             lookup[_normalize(value)] = character
     return lookup
+
+
+def _role_mapping_lookup(
+    rules: list[RoleMappingRule],
+    by_id: dict[str, Character],
+    by_name: dict[str, Character],
+) -> dict[str, tuple[RoleMappingRule, Character | None]]:
+    lookup: dict[str, tuple[RoleMappingRule, Character | None]] = {}
+    for rule in rules:
+        character = None
+        if rule.enabled:
+            character = by_id.get(rule.library_character_id) or by_name.get(
+                _normalize(rule.library_character_name)
+            )
+        lookup[_normalize(rule.script_role_name)] = (rule, character)
+    return lookup
+
+
+def _document_mapping_for_role(
+    mappings: dict[str, tuple[RoleMappingRule, Character | None]],
+    display_name: str,
+    character_id: str,
+) -> tuple[RoleMappingRule | None, Character | None]:
+    return mappings.get(_normalize(display_name)) or mappings.get(
+        _normalize(character_id)
+    ) or (None, None)
 
 
 def _character_match_values(character: Character) -> list[str]:

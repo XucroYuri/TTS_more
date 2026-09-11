@@ -1,5 +1,6 @@
 from app.models import Character, EngineName, ScriptLine, ScriptProject, VoiceBinding, VoiceProfile
 from app.role_library import common_logs_presets, match_project_characters, resolve_project_characters, slugify_role_name
+from app.role_mapping_document import RoleMappingRule
 
 
 def test_project_character_matching_uses_aliases_nicknames_and_match_names() -> None:
@@ -59,6 +60,43 @@ def test_force_rematch_only_links_library_role_without_renaming_script_role() ->
 
     assert mappings[0].library_character_id == "xin-chen-t-t-s"
     assert mappings[0].name == "幽灵"
+
+
+def test_markdown_mapping_overrides_existing_link_and_can_disable_matching() -> None:
+    library = [
+        Character(id="old-voice", name="旧音色", aliases=["幽灵"], library_status="confirmed"),
+        Character(id="new-voice", name="新音色", library_status="confirmed"),
+    ]
+    project = ScriptProject(
+        title="demo",
+        project_characters=[
+            {
+                "project_character_id": "ghost",
+                "name": "幽灵",
+                "library_character_id": "old-voice",
+                "mode": "reference",
+            }
+        ],
+        lines=[ScriptLine(id="l001", character_id="ghost", text="快跑！")],
+    )
+
+    remapped = match_project_characters(
+        project,
+        library,
+        force=True,
+        role_mappings=[RoleMappingRule("幽灵", "new-voice", "新音色")],
+    )
+    disabled = match_project_characters(
+        project,
+        library,
+        force=True,
+        role_mappings=[RoleMappingRule("幽灵", enabled=False)],
+    )
+
+    assert remapped[0].library_character_id == "new-voice"
+    assert remapped[0].name == "幽灵"
+    assert disabled[0].library_character_id is None
+    assert disabled[0].match_status == "unmatched"
 
 
 def test_unmatched_project_character_resolves_without_default_tts_profile() -> None:
