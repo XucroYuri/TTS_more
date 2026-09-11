@@ -1,4 +1,4 @@
-import { Loader2, Sparkles, Trash2 } from "lucide-react";
+import { Loader2, RefreshCw, Sparkles, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -16,6 +16,7 @@ interface VoiceCandidatePanelProps {
   onSelect: (candidateId: string) => void;
   onConfirmIdentity: (candidateId: string) => void;
   onClear: () => void;
+  onRefresh: () => void;
   onSyncAssets?: () => void;
   onOpenServices?: () => void;
 }
@@ -34,6 +35,7 @@ export function VoiceCandidatePanel({
   onSelect,
   onConfirmIdentity,
   onClear,
+  onRefresh,
   onSyncAssets,
   onOpenServices
 }: VoiceCandidatePanelProps) {
@@ -60,11 +62,24 @@ export function VoiceCandidatePanel({
           <span className="voice-panel-eyebrow"><Sparkles size={14} />{t("voiceMatching.candidateEyebrow")}</span>
           <h3>{t("voiceMatching.candidateTitle")}</h3>
         </div>
-        {selection && (
-          <button className="secondary-button compact-button" type="button" onClick={onClear} disabled={Boolean(selectingCandidateId)}>
-            <Trash2 size={13} />{t("voiceMatching.clearSelection")}
+        <div className="voice-panel-actions">
+          {selection && (
+            <button className="secondary-button compact-button" type="button" onClick={onClear} disabled={Boolean(selectingCandidateId)}>
+              <Trash2 size={13} />{t("voiceMatching.clearSelection")}
+            </button>
+          )}
+          <button
+            className="secondary-button compact-button"
+            type="button"
+            onClick={() => {
+              setRejectedCandidateIds(new Set());
+              onRefresh();
+            }}
+            disabled={loading || Boolean(selectingCandidateId)}
+          >
+            <RefreshCw className={loading ? "spin" : undefined} size={13} />{t("actions.refresh")}
           </button>
-        )}
+        </div>
       </div>
 
       {loading && <div className="voice-panel-empty"><Loader2 className="spin" size={15} />{t("voiceMatching.loadingCandidates")}</div>}

@@ -73,6 +73,7 @@ describe("VoiceCandidatePanel", () => {
     views.push({ root, dom });
     const onSelect = vi.fn();
     const onClear = vi.fn();
+    const onRefresh = vi.fn();
 
     await act(async () => root.render(createElement(VoiceCandidatePanel, {
       recommendation,
@@ -82,7 +83,8 @@ describe("VoiceCandidatePanel", () => {
       referenceAudioUrl: (assetId: string) => `/preview/${assetId}`,
       onSelect,
       onConfirmIdentity: vi.fn(),
-      onClear
+      onClear,
+      onRefresh
     })));
 
     const text = dom.window.document.body.textContent ?? "";
@@ -107,6 +109,10 @@ describe("VoiceCandidatePanel", () => {
       .find((button) => button.textContent?.includes("取消选择"));
     await act(async () => clearButton?.click());
     expect(onClear).toHaveBeenCalledOnce();
+    const refreshButton = [...dom.window.document.querySelectorAll("button")]
+      .find((button) => button.textContent?.includes("刷新"));
+    await act(async () => refreshButton?.click());
+    expect(onRefresh).toHaveBeenCalledOnce();
   });
 
   it("shows a neutral no-match message without a role-mapping action", async () => {
@@ -133,7 +139,8 @@ describe("VoiceCandidatePanel", () => {
       referenceAudioUrl: (assetId: string) => `/preview/${assetId}`,
       onSelect: vi.fn(),
       onConfirmIdentity: vi.fn(),
-      onClear: vi.fn()
+      onClear: vi.fn(),
+      onRefresh: vi.fn()
     })));
 
     const text = dom.window.document.body.textContent ?? "";
@@ -175,7 +182,8 @@ describe("VoiceCandidatePanel", () => {
       referenceAudioUrl: (assetId: string) => `/preview/${assetId}`,
       onSelect: vi.fn(),
       onConfirmIdentity,
-      onClear: vi.fn()
+      onClear: vi.fn(),
+      onRefresh: vi.fn()
     })));
 
     const text = dom.window.document.body.textContent ?? "";

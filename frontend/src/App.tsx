@@ -1330,6 +1330,16 @@ export default function App() {
     }
   }
 
+  function refreshActiveVoiceRecommendation() {
+    const projectId = currentProjectId;
+    const lineId = activeLine?.id;
+    const catalogVersion = voiceCatalog?.catalog_version;
+    if (!projectId || !lineId || !catalogVersion) return;
+    voiceRecommendationCacheRef.current.delete(`${projectId}|${lineId}|${catalogVersion}`);
+    setVoiceRecommendationError(null);
+    setVoiceRecommendationEpoch((current) => current + 1);
+  }
+
   async function chooseVoiceCandidate(candidateId: string) {
     if (!currentProjectId || !activeLine) return;
     const projectId = currentProjectId;
@@ -4511,6 +4521,7 @@ export default function App() {
                   onSelect={(candidateId) => void chooseVoiceCandidate(candidateId)}
                   onConfirmIdentity={(candidateId) => void confirmFuzzyVoiceIdentity(candidateId)}
                   onClear={() => void clearActiveVoiceSelection()}
+                  onRefresh={refreshActiveVoiceRecommendation}
                   onSyncAssets={() => void runVoiceCatalogSync()}
                   onOpenServices={() => setIsVoiceConfigurationOpen(true)}
                 />
