@@ -5165,7 +5165,7 @@ h3 {
   position: relative;
   z-index: 1;
   display: grid;
-  grid-template-columns: minmax(220px, 1fr) auto auto minmax(156px, auto);
+  grid-template-columns: minmax(220px, 1fr) auto auto;
   gap: var(--space-2);
   align-items: center;
   min-height: 48px;
@@ -5251,35 +5251,6 @@ h3 {
   justify-content: center;
 }
 
-.task-actions {
-  display: inline-flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: var(--space-2);
-  min-width: 0;
-}
-
-.task-actions .primary-button {
-  height: 32px;
-  white-space: nowrap;
-}
-
-.generation-progress-inline {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--geist-blue-600, #0070f3);
-  white-space: nowrap;
-}
-
-.cancel-button {
-  color: var(--geist-red-700, #dc2626);
-  border-color: var(--geist-red-700, #dc2626);
-}
-
-.cancel-button:hover {
-  background: color-mix(in srgb, var(--geist-red-700, #dc2626) 10%, #fff);
-}
-
 .filters-row select,
 .field-grid input,
 .field-grid select,
@@ -5355,14 +5326,6 @@ h3 {
   border-bottom: 1px solid var(--geist-alpha-200);
 }
 
-.select-all {
-  height: 28px;
-  border: 0;
-  color: var(--geist-gray-900);
-  background: transparent;
-  text-align: left;
-}
-
 .line-row {
   position: relative;
   min-height: 76px;
@@ -5374,11 +5337,6 @@ h3 {
 .line-row.active {
   background: var(--geist-blue-50);
   box-shadow: inset 3px 0 0 var(--geist-blue-600);
-}
-
-.line-check {
-  display: inline-flex;
-  align-items: center;
 }
 
 .line-id {
@@ -7844,15 +7802,8 @@ h3 {
     grid-template-columns: 1fr;
   }
 
-  .line-filter-menu > summary,
-  .task-actions,
-  .task-actions .primary-button,
-  .task-actions .secondary-button {
+  .line-filter-menu > summary {
     width: 100%;
-  }
-
-  .task-actions {
-    justify-content: stretch;
   }
 
   .line-filter-popover {

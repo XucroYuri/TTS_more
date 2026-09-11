@@ -29,7 +29,6 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       newProject: "新建剧本",
       importProject: "导入剧本",
       projectCount: "{{count}} 个剧本",
-      queueSelected: "生成已选台词",
       reviewConfirmedAnnotations: "返回分析结果",
       reviewConfirmedAnnotationsHint: "返回查看已确认的说话者、情感证据与台词标注",
       analysisResultUnavailable: "当前剧本暂无可返回的分析结果"
@@ -387,7 +386,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       addScript: "添加剧本",
       deleteScriptNamed: "删除剧本 {{title}}",
       openScript: "打开剧本",
-      saveRevision: "保存新版本",
+      saveRevision: "保存",
       analyze: "开始分析",
       reanalyze: "重新分析",
       parseRevision: "旧版解析",
@@ -982,6 +981,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
     },
     queue: {
       title: "队列",
+      readOnlyHint: "仅查看每条生成的状态与进度",
       polling: "轮询中",
       synced: "已同步",
       notSynced: "未同步",
@@ -1072,7 +1072,6 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       newProject: "New script",
       importProject: "Import script",
       projectCount: "{{count}} scripts",
-      queueSelected: "Generate selected lines",
       reviewConfirmedAnnotations: "Return to analysis",
       reviewConfirmedAnnotationsHint: "Return to the confirmed speaker, emotion evidence, and dialogue analysis",
       analysisResultUnavailable: "This script has no analysis result to return to"
@@ -1430,7 +1429,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       addScript: "Add script",
       deleteScriptNamed: "Delete script {{title}}",
       openScript: "Open script",
-      saveRevision: "Save revision",
+      saveRevision: "Save",
       analyze: "Start analysis",
       reanalyze: "Reanalyze",
       parseRevision: "Legacy parse",
@@ -2025,6 +2024,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
     },
     queue: {
       title: "Queue",
+      readOnlyHint: "View each generation status and progress",
       polling: "Polling",
       synced: "Synced",
       notSynced: "Not synced",

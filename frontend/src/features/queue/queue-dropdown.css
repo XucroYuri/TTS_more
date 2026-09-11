@@ -1,0 +1,127 @@
+.line-queue-menu {
+  position: relative;
+  min-width: 0;
+}
+
+.line-queue-menu > summary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-width: 92px;
+  min-height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--geist-alpha-200);
+  border-radius: var(--radius-sm);
+  background: var(--geist-bg);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 650;
+  list-style: none;
+}
+
+.line-queue-menu > summary::-webkit-details-marker {
+  display: none;
+}
+
+.line-queue-menu > summary b {
+  min-width: 18px;
+  padding: 1px 5px;
+  border-radius: 999px;
+  color: var(--geist-blue-700);
+  background: var(--geist-blue-100);
+  text-align: center;
+  font-size: 11px;
+}
+
+.line-queue-menu[open] > summary {
+  border-color: var(--geist-blue-600);
+  background: var(--geist-blue-50);
+}
+
+.line-queue-popover {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 10;
+  width: min(420px, calc(100vw - 48px));
+  max-height: min(520px, calc(100vh - 180px));
+  overflow: auto;
+  padding: var(--space-2);
+  border: 1px solid var(--geist-gray-200);
+  border-radius: var(--radius-sm);
+  background: var(--geist-bg);
+  box-shadow: 0 16px 38px #00000018;
+}
+
+.line-queue-heading {
+  display: grid;
+  gap: 2px;
+  padding: 4px 4px 8px;
+}
+
+.line-queue-heading span,
+.line-queue-empty {
+  color: var(--geist-gray-900);
+  font-size: 12px;
+}
+
+.line-queue-list {
+  display: grid;
+  gap: 6px;
+}
+
+.line-queue-item {
+  display: grid;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid var(--geist-alpha-200);
+  border-radius: var(--radius-sm);
+}
+
+.line-queue-item-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.line-queue-item-head > strong {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 12px;
+}
+
+.line-queue-item-head > b {
+  min-width: 32px;
+  text-align: right;
+  font-size: 12px;
+}
+
+.line-queue-progress {
+  height: 4px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--geist-alpha-200);
+}
+
+.line-queue-progress > span {
+  display: block;
+  height: 100%;
+  background: var(--geist-blue-600);
+  transition: width 180ms ease;
+}
+
+@media (max-width: 760px) {
+  .line-queue-menu > summary {
+    width: 100%;
+  }
+
+  .line-queue-popover {
+    position: static;
+    width: 100%;
+    margin-top: var(--space-2);
+    box-shadow: none;
+  }
+}

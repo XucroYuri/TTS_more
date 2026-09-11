@@ -9,7 +9,7 @@ describe("workbench view helpers", () => {
     expect(roleAccentClass(9)).toBe("role-accent-1");
   });
 
-  it("expands the clicked line while leaving checkbox selection independent", () => {
+  it("expands the clicked line and focuses a role without expanding it", () => {
     expect(lineFocusTransition({ activeLineId: "l001", expandedLineId: "l001" }, "l002", "card")).toEqual({
       activeLineId: "l002",
       expandedLineId: "l002"
@@ -18,9 +18,9 @@ describe("workbench view helpers", () => {
       activeLineId: "l002",
       expandedLineId: "l002"
     });
-    expect(lineFocusTransition({ activeLineId: "l001", expandedLineId: "l001" }, "l002", "checkbox")).toEqual({
-      activeLineId: "l001",
-      expandedLineId: "l001"
+    expect(lineFocusTransition({ activeLineId: "l001", expandedLineId: "l001" }, "l002", "role")).toEqual({
+      activeLineId: "l002",
+      expandedLineId: null
     });
   });
 
@@ -86,13 +86,10 @@ describe("workbench view helpers", () => {
     expect(lineWorkbenchControlsState({
       hasProject: false,
       totalLineCount: 0,
-      filteredLineCount: 0,
-      selectedLineCount: 0,
-      isGenerating: false
+      filteredLineCount: 0
     })).toEqual({
       filtersVisible: false,
       roleStripVisible: false,
-      generationVisible: false,
       clearFiltersVisible: false,
       emptyState: "no_project"
     });
@@ -100,26 +97,20 @@ describe("workbench view helpers", () => {
     expect(lineWorkbenchControlsState({
       hasProject: true,
       totalLineCount: 0,
-      filteredLineCount: 0,
-      selectedLineCount: 0,
-      isGenerating: false
+      filteredLineCount: 0
     })).toMatchObject({
       filtersVisible: false,
       roleStripVisible: false,
-      generationVisible: false,
       emptyState: "no_lines"
     });
 
     expect(lineWorkbenchControlsState({
       hasProject: true,
       totalLineCount: 8,
-      filteredLineCount: 0,
-      selectedLineCount: 0,
-      isGenerating: false
+      filteredLineCount: 0
     })).toMatchObject({
       filtersVisible: true,
       roleStripVisible: true,
-      generationVisible: false,
       clearFiltersVisible: true,
       emptyState: "no_matches"
     });
@@ -127,21 +118,10 @@ describe("workbench view helpers", () => {
     expect(lineWorkbenchControlsState({
       hasProject: true,
       totalLineCount: 8,
-      filteredLineCount: 3,
-      selectedLineCount: 0,
-      isGenerating: false
-    }).generationVisible).toBe(false);
-
-    expect(lineWorkbenchControlsState({
-      hasProject: true,
-      totalLineCount: 8,
-      filteredLineCount: 3,
-      selectedLineCount: 2,
-      isGenerating: false
+      filteredLineCount: 3
     })).toMatchObject({
       filtersVisible: true,
       roleStripVisible: true,
-      generationVisible: true,
       emptyState: null
     });
   });

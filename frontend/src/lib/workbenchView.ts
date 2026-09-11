@@ -19,7 +19,7 @@ export type InspectorPanelMode = "line_config" | "version_params";
 export type InspectorSectionId = "config" | "reference" | "version" | "diagnostics";
 export type InspectorDiagnosticsTone = "neutral" | "warn" | "danger";
 export type InspectorDiagnosticsReason = "ready" | "not_loaded" | "signature_mismatch" | "error" | "manual";
-export type LineFocusIntent = "card" | "checkbox" | "role";
+export type LineFocusIntent = "card" | "role";
 export type GenerationMethodId = "gpt-sovits" | "indextts" | "cosyvoice" | "commercial";
 
 export interface InspectorDiagnosticsInput {
@@ -86,14 +86,11 @@ export interface LineWorkbenchControlsInput {
   hasProject: boolean;
   totalLineCount: number;
   filteredLineCount: number;
-  selectedLineCount: number;
-  isGenerating: boolean;
 }
 
 export interface LineWorkbenchControlsState {
   filtersVisible: boolean;
   roleStripVisible: boolean;
-  generationVisible: boolean;
   clearFiltersVisible: boolean;
   emptyState: LineWorkbenchEmptyState;
 }
@@ -144,7 +141,6 @@ export function preflightLoadLabelKey(item: PreflightFallbackEntry | undefined, 
 }
 
 export function lineFocusTransition(current: LineFocusState, lineId: string, intent: LineFocusIntent): LineFocusState {
-  if (intent === "checkbox") return current;
   if (intent === "role") {
     return {
       activeLineId: lineId,
@@ -244,7 +240,6 @@ export function lineWorkbenchControlsState(input: LineWorkbenchControlsInput): L
     return {
       filtersVisible: false,
       roleStripVisible: false,
-      generationVisible: false,
       clearFiltersVisible: false,
       emptyState: "no_project"
     };
@@ -254,7 +249,6 @@ export function lineWorkbenchControlsState(input: LineWorkbenchControlsInput): L
     return {
       filtersVisible: false,
       roleStripVisible: false,
-      generationVisible: false,
       clearFiltersVisible: false,
       emptyState: "no_lines"
     };
@@ -264,7 +258,6 @@ export function lineWorkbenchControlsState(input: LineWorkbenchControlsInput): L
   return {
     filtersVisible: true,
     roleStripVisible: true,
-    generationVisible: input.isGenerating || input.selectedLineCount > 0,
     clearFiltersVisible: !hasMatches,
     emptyState: hasMatches ? null : "no_matches"
   };

@@ -51,7 +51,6 @@ import {
   fetchServiceLogs,
   fetchServices,
   fetchServicesStatus,
-  fetchGenerationJob,
   fetchQueueStatus,
   generationPreflight,
   fetchVoiceCandidates,
@@ -59,7 +58,6 @@ import {
   fetchLogsCandidates,
   freezeProjectCharacter,
   createGenerationJob,
-  cancelGenerationJob,
   createScriptRevision,
   deleteProject,
   deleteGenerationVersion,
@@ -94,6 +92,7 @@ import { TokenGate } from "./components/TokenGate";
 import { VoiceAssetStatusPanel } from "./features/voice-matching/VoiceAssetStatusPanel";
 import { VoiceCandidatePanel } from "./features/voice-matching/VoiceCandidatePanel";
 import { voiceCatalogReady } from "./features/voice-matching/voiceReadiness";
+import { QueueDropdown } from "./features/queue/QueueDropdown";
 import { QueuePanel } from "./features/queue/QueuePanel";
 import { RoleLibraryPanel } from "./features/roles/RoleLibraryPanel";
 import { useRoleLibraryController } from "./features/roles/useRoleLibraryController";
@@ -130,7 +129,8 @@ import {
   writeAnalysisRunSession
 } from "./features/script-analysis/analysisSessionStorage";
 import { generationFailureView, generationVersionTags, groupGenerationVersions, newestPlayableVersion, versionToInspectorDraft, type InspectorVersionDraft } from "./lib/generationHistory";
-import { generationStatusCounts, generationStatusKey, generationStatusTone, generationTerminalNotice, isTerminalGenerationStatus, reconcileGenerationJobSnapshot, type GenerationStatusTone } from "./lib/generationStatus";
+import { generationStatusCounts, generationStatusKey, generationStatusTone, isTerminalGenerationStatus, type GenerationStatusTone } from "./lib/generationStatus";
+import { generationLineKey, latestQueueItemForLine, lineHasActiveGeneration, upsertGenerationJob } from "./lib/generationQueue";
 import {
   CATALOG_STAGED_REFERENCE_OPTION,
   applyLogsReferenceSampleToConfig,
@@ -149,7 +149,7 @@ import { createEmptyManifest, createEmptyProject, createProjectId, readStoredPro
 import { filterAndSortProjectSummaries, nextProjectAfterDelete, projectPreviewStats } from "./lib/scriptManagement";
 import { projectToScriptSourceText } from "./lib/scriptSource";
 import { summarizeLineHistory } from "./lib/status";
-import { coreLocalProviders, coreProviderCoverage, filterScriptLines, isServiceOperational, lineHistoryForLine, routableProviderServices, serviceTopbarHealthItems, serviceTopbarSummary, standardProjectName, toggleLineSelection, validationRunState, type LineStatusFilter } from "./lib/workstation";
+import { coreLocalProviders, coreProviderCoverage, filterScriptLines, isServiceOperational, lineHistoryForLine, routableProviderServices, serviceTopbarHealthItems, serviceTopbarSummary, standardProjectName, validationRunState, type LineStatusFilter } from "./lib/workstation";
 import { buildComfyUIEndpointRequest, ttsAudioSuiteContractForProvider } from "./lib/ttsAccess";
 import { createToast, inferToastLevel, shouldToastNotice, toastDuration, type Toast, type ToastLevel, type ToastOptions } from "./lib/toast";
 import { generationMethodForProvider, generationMethodOptions, generationMethodRouteLabels, historyPlayerSummary, inspectorBackupReferenceVisible, inspectorDiagnosticsState, inspectorPanelMode, inspectorSections, lineCardSecondaryBadges, lineFilterToolbarState, lineFocusTransition, lineWorkbenchControlsState, preflightFallbackAction, preflightLineLabelKey, preflightLineTone, preflightLoadLabelKey, preflightLoadTone, roleAccentClass, shouldRequestRevisionConfirmation, trustedBackupReferenceGroups, type GenerationMethodId, type LineCardSecondaryBadge } from "./lib/workbenchView";
@@ -172,7 +172,6 @@ import type {
   VoiceRecommendation,
   VoiceProfile,
   WorkerHealth,
-  GenerationJob,
   GenerationVersion,
   GenerationTask,
   GenerationPreflightResponse,
@@ -286,7 +285,7 @@ export default function App() {
   const [diagnosticsExpanded, setDiagnosticsExpanded] = useState(false);
   const [routeSettingsOpen, setRouteSettingsOpen] = useState(false);
   const [isVoiceConfigurationOpen, setIsVoiceConfigurationOpen] = useState(false);
-  const [selectedLineIds, setSelectedLineIds] = useState<string[]>([]);
+  const [submittingGenerationKeys, setSubmittingGenerationKeys] = useState<string[]>([]);
   const [lineTextDrafts, setLineTextDrafts] = useState<Record<string, string>>({});
   const [parserProviders, setParserProviders] = useState<ParserProviderDraft[]>([]);
   const [roleLibraryCandidates, setRoleLibraryCandidates] = useState<RoleLibraryCandidate[]>([]);
@@ -303,7 +302,6 @@ export default function App() {
   const [kwjmApiKeyInput, setKwjmApiKeyInput] = useState("");
   const [kwjmParserTestResult, setKwjmParserTestResult] = useState<ParserProviderTestResponse | null>(null);
   const [isLlmAdvancedOpen, setIsLlmAdvancedOpen] = useState(false);
-  const [isGenerating, setIsGenerating] = useState(false);
   const [isRefreshingTopology, setIsRefreshingTopology] = useState(false);
   const [isValidating, setIsValidating] = useState(false);
   const [isSavingServiceConfig, setIsSavingServiceConfig] = useState(false);
@@ -348,10 +346,7 @@ export default function App() {
   const [selectedLogsServiceId, setSelectedLogsServiceId] = useState<string>("");
   const [activeLibraryCharacterId, setActiveLibraryCharacterId] = useState<string | null>(null);
   const [activeRoleCandidateId, setActiveRoleCandidateId] = useState<string | null>(null);
-  const [activeJob, setActiveJob] = useState<GenerationJob | null>(null);
-  const generationCancellationJobIdRef = useRef<string | null>(null);
-  const isGeneratingRef = useRef(false);
-  const generationRunTokenRef = useRef(0);
+  const submittingGenerationKeysRef = useRef<Set<string>>(new Set());
   const managedProjectIdRef = useRef<string | null>(managedProjectId);
   const currentProjectIdRef = useRef<string | null>(currentProjectId);
   const analysisProjectIdRef = useRef<string | null>(null);
@@ -363,7 +358,6 @@ export default function App() {
   const analysisStartOperationTokenRef = useRef(0);
   const analysisManagerSavingTokenRef = useRef<number | null>(null);
   const analysisRestoreOperationTokenRef = useRef(0);
-  const lastGenerationProjectIdRef = useRef<string | null>(null);
   const saveChainRef = useRef<Promise<void>>(Promise.resolve());
   const pendingProjectAutosaveRef = useRef<PendingProjectAutosave | null>(null);
   const workspaceBaselineByProjectRef = useRef<Map<string, string>>(new Map());
@@ -564,10 +558,6 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (lastGenerationProjectIdRef.current !== currentProjectId) {
-      lastGenerationProjectIdRef.current = currentProjectId;
-      generationRunTokenRef.current += 1;
-    }
     if (!currentProjectId) {
       setProject(createEmptyProject());
       setManifest(createEmptyManifest(null));
@@ -575,7 +565,6 @@ export default function App() {
       setExpandedLineId(null);
       setSelectedHistoryVersions({});
       setVersionDrafts({});
-      setSelectedLineIds([]);
       setLineTextDrafts({});
       setIsProjectLoaded(true);
       setSaveState("idle");
@@ -649,7 +638,6 @@ export default function App() {
         setExpandedLineId(null);
         setSelectedHistoryVersions({});
         setVersionDrafts({});
-        setSelectedLineIds([]);
         setLineTextDrafts({});
         setIsProjectLoaded(true);
         setNotice(t("empty.projectLoadFailed"));
@@ -918,8 +906,8 @@ export default function App() {
   );
   const showBackupReferenceSource = inspectorBackupReferenceVisible(activeProvider, candidateReferenceGroups.length);
   const validationState = useMemo(
-    () => validationRunState(runtime, services, voiceCatalog, manifest, isValidating, isGenerating),
-    [runtime, services, voiceCatalog, manifest, isValidating, isGenerating]
+    () => validationRunState(runtime, services, voiceCatalog, manifest, isValidating, submittingGenerationKeys.length > 0),
+    [runtime, services, voiceCatalog, manifest, isValidating, submittingGenerationKeys.length]
   );
   const validationSteps = useMemo(() => buildValidationSteps(runtime, services, voiceCatalog, manifest, t), [runtime, services, voiceCatalog, manifest, t]);
   const filteredLines = useMemo(
@@ -935,7 +923,6 @@ export default function App() {
   );
   const displayedLines = useMemo(() => filteredLines.slice(0, visibleLineCount), [filteredLines, visibleLineCount]);
   const hasMoreFilteredLines = displayedLines.length < filteredLines.length;
-  const selectedLines = useMemo(() => project.lines.filter((line) => selectedLineIds.includes(line.id)), [project.lines, selectedLineIds]);
   const providerOptions = useMemo(() => Array.from(new Set(project.lines.map((line) => lineBinding(line, resolvedCharacters)?.provider_type ?? "unassigned"))), [project.lines, resolvedCharacters]);
   const lineToolbarState = lineFilterToolbarState({
     providerFilter,
@@ -948,9 +935,7 @@ export default function App() {
   const lineWorkbenchState = lineWorkbenchControlsState({
     hasProject: Boolean(currentProjectId),
     totalLineCount: project.lines.length,
-    filteredLineCount: filteredLines.length,
-    selectedLineCount: selectedLineIds.length,
-    isGenerating
+    filteredLineCount: filteredLines.length
   });
   const lineFilterTitle = lineToolbarState.title;
   const selectedLanguage = normalizeLanguage(i18n.resolvedLanguage ?? i18n.language ?? defaultLanguage);
@@ -1075,17 +1060,29 @@ export default function App() {
   const paidServiceCount = useMemo(() => visibleServices.filter((service) => service.capabilities?.includes("paid_provider")), [visibleServices]);
   const serviceSummary = useMemo(() => serviceTopbarSummary(visibleServices, voiceCatalog, parserProviders), [parserProviders, visibleServices, voiceCatalog]);
   const serviceHealthItems = useMemo(() => serviceTopbarHealthItems(serviceSummary), [serviceSummary]);
+  const queueJobs = useMemo(() => queueStatus?.jobs ?? [], [queueStatus]);
+  const queueLineLabels = useMemo(() => {
+    const labels: Record<string, string> = {};
+    for (const line of project.lines) {
+      const label = `${characterName(resolvedCharacters, line.character_id)} · ${line.text}`;
+      labels[line.id] = label;
+      if (line.line_uid) labels[line.line_uid] = label;
+    }
+    return labels;
+  }, [project.lines, resolvedCharacters]);
   const selectedConfigService = useMemo(
     () => ttsServices.find((service) => service.service_id === expandedServiceConfigId) ?? ttsServices[0],
     [expandedServiceConfigId, ttsServices]
   );
   const runningServiceIds = useMemo(() => {
     const ids = new Set<string>();
-    for (const item of activeJob?.items ?? []) {
-      if (item.service_id && generationStatusTone(item.status) === "running") ids.add(item.service_id);
+    for (const job of queueJobs) {
+      for (const item of job.items) {
+        if (item.service_id && generationStatusTone(item.status) === "running") ids.add(item.service_id);
+      }
     }
     return ids;
-  }, [activeJob]);
+  }, [queueJobs]);
   const activeRouteServices = useMemo(() => routableProviderServices(visibleServices, activeProvider), [activeProvider, visibleServices]);
   const activeSelectedServiceUnavailable = Boolean(activeServiceId && !activeRouteServices.some((service) => service.service_id === activeServiceId));
   const selectedOpenSourceCatalog = useMemo(
@@ -1100,7 +1097,6 @@ export default function App() {
     () => serviceHealthItems.find((item) => item.id === "parser"),
     [serviceHealthItems]
   );
-  const queueJobs = useMemo(() => queueStatus?.jobs ?? [], [queueStatus]);
   const queueItems = useMemo(() => queueJobs.flatMap((job) => job.items), [queueJobs]);
   const queueCounts = useMemo(() => generationStatusCounts(queueItems.map((item) => item.status)), [queueItems]);
   const queueRunningItems = queueStatus?.running ?? queueCounts.running;
@@ -1110,25 +1106,53 @@ export default function App() {
   const queueCancelledItems = queueCounts.cancelled;
   const queueProcessedItems = queueCounts.processed;
   const queueTotalItems = Math.max(queueCounts.total, queueProcessedItems + queueRunningItems + queueQueuedItems);
-  const queueActiveJob = activeJob && !isTerminalGenerationStatus(activeJob.status)
-    ? activeJob
-    : queueJobs.find((job) => !isTerminalGenerationStatus(job.status)) ?? null;
+  const queueActiveJob = queueJobs.find((job) => !isTerminalGenerationStatus(job.status)) ?? null;
+  const queueHasActiveWork = queueJobs.some((job) => !isTerminalGenerationStatus(job.status));
   const queueProgressRatio = queueActiveJob
     ? queueActiveJob.progress
     : queueTotalItems > 0
       ? queueProcessedItems / queueTotalItems
       : 0;
   const queueProgressPercent = Math.round(Math.max(0, Math.min(1, queueProgressRatio)) * 100);
-  const activeJobCancellationRequested = Boolean(
-    activeJob
-    && (
-      generationCancellationJobIdRef.current === activeJob.job_id
-      || activeJob.status === "cancelling"
-    ),
+  const activeLineQueueItem = activeLine ? latestQueueItemForLine(queueJobs, currentProjectId, activeLine) : undefined;
+  const activeLineSubmitting = Boolean(
+    currentProjectId
+    && activeLine
+    && submittingGenerationKeys.includes(generationLineKey(currentProjectId, activeLine))
   );
+  const activeLineGenerationBusy = activeLineSubmitting || Boolean(activeLineQueueItem && !isTerminalGenerationStatus(activeLineQueueItem.status));
   const queueSyncLabel = isRefreshingTopology ? t("queue.polling") : t(queueStatus ? "queue.synced" : "queue.notSynced");
   const queueVisibleStatusLabel = queueActiveJob ? t(generationStatusKey(queueActiveJob.status)) : queueSyncLabel;
   const queueVisibleTone = queueActiveJob ? generationStatusTone(queueActiveJob.status) : isRefreshingTopology ? "running" : "idle";
+
+  useEffect(() => {
+    if (!queueHasActiveWork) return;
+    let disposed = false;
+    let timer: number | undefined;
+    const pollQueue = async () => {
+      let keepPolling = true;
+      try {
+        const nextQueue = await fetchQueueStatus();
+        if (disposed) return;
+        setQueueStatus(nextQueue);
+        keepPolling = nextQueue.jobs.some((job) => !isTerminalGenerationStatus(job.status));
+        if (currentProjectId && nextQueue.jobs.some((job) => job.project_id === currentProjectId)) {
+          const nextManifest = await fetchManifest(currentProjectId).catch(() => null);
+          if (!disposed && nextManifest) setManifest(nextManifest);
+        }
+      } catch {
+        keepPolling = true;
+      } finally {
+        if (!disposed && keepPolling) timer = window.setTimeout(pollQueue, 1000);
+      }
+    };
+    timer = window.setTimeout(pollQueue, 400);
+    return () => {
+      disposed = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [currentProjectId, queueHasActiveWork]);
+
   const topologyModalTitle =
     servicePanelSection === "roles"
       ? t("characters.libraryManager")
@@ -1174,7 +1198,7 @@ export default function App() {
     fetchServiceLoadState(activeServiceId)
       .then((state) => setServiceLoadStates((current) => ({ ...current, [activeServiceId]: state })))
       .catch(() => undefined);
-  }, [activeServiceId, activeJob?.updated_at, activeVersions.length]);
+  }, [activeServiceId, queueActiveJob?.updated_at, activeVersions.length]);
 
   useEffect(() => {
     if (!activeLogsReferenceRequest) return;
@@ -1502,7 +1526,6 @@ export default function App() {
       setManifest(createEmptyManifest(projectId));
       setActiveLineId("");
       setExpandedLineId(null);
-      setSelectedLineIds([]);
       setSelectedHistoryVersions({});
       setVersionDrafts({});
       managedProjectIdRef.current = projectId;
@@ -1558,7 +1581,6 @@ export default function App() {
     }));
     setActiveLineId(revision.lines[0]?.id ?? "");
     setExpandedLineId(null);
-    setSelectedLineIds([]);
   }
 
   function updateParserProvider(index: number, patch: Partial<ParserProviderDraft>) {
@@ -1840,17 +1862,19 @@ export default function App() {
     }
   }
 
-  async function runQueue(lines = project.lines) {
-    if (!currentProjectId) {
+  async function runQueue(lines: ScriptLine[]) {
+    const projectId = currentProjectId;
+    if (!projectId) {
       setNotice(t("empty.noProjectAction"));
       return;
     }
-    if (isGeneratingRef.current) return;
-    isGeneratingRef.current = true;
-    generationRunTokenRef.current += 1;
-    const runToken = generationRunTokenRef.current;
-    setIsGenerating(true);
-    generationCancellationJobIdRef.current = null;
+    const submissionKeys = lines.map((line) => generationLineKey(projectId, line));
+    if (
+      submissionKeys.some((key) => submittingGenerationKeysRef.current.has(key))
+      || lines.some((line) => lineHasActiveGeneration(queueJobs, projectId, line))
+    ) return;
+    submissionKeys.forEach((key) => submittingGenerationKeysRef.current.add(key));
+    setSubmittingGenerationKeys((current) => Array.from(new Set([...current, ...submissionKeys])));
     setNotice(t("notice.generating"));
     try {
       const { tasks, blocked } = buildRunnableTasks(lines, resolvedCharacters);
@@ -1858,42 +1882,22 @@ export default function App() {
         setNotice(t("notice.linesNeedBinding", { count: blocked.length }), { level: "warning" });
       }
       if (tasks.length === 0) return;
-      const preflight = await ensureGenerationPreflight(tasks);
-      if (runToken !== generationRunTokenRef.current) return;
+      const preflight = await ensureGenerationPreflight(projectId, tasks);
       if (preflight.status !== "ready") return;
-      const job = await createGenerationJob(currentProjectId, tasks);
-      if (runToken !== generationRunTokenRef.current) return;
-      setActiveJob(job);
+      const job = await createGenerationJob(projectId, tasks);
+      setQueueStatus((current) => upsertGenerationJob(current, job));
       setNotice(t("notice.jobQueued", { job: job.job_id }));
-      const finalJob = await pollGenerationJob(job.job_id, runToken);
-      if (finalJob === null || runToken !== generationRunTokenRef.current) return;
-      setActiveJob((current) => reconcileGenerationJobSnapshot(
-        current,
-        finalJob,
-        generationCancellationJobIdRef.current === finalJob.job_id,
-      ));
-      const nextManifest = await fetchManifest(currentProjectId);
-      if (runToken !== generationRunTokenRef.current) return;
-      setManifest(nextManifest);
-      const terminalNotice = generationTerminalNotice(finalJob.status);
-      if (terminalNotice) {
-        setNotice(t(terminalNotice.key), { level: terminalNotice.level });
-      }
-      void refreshTopology();
+      if (isTerminalGenerationStatus(job.status)) void refreshTopology();
     } catch (error) {
       setNotice(error instanceof Error ? error.message : t("notice.generationFailed"));
     } finally {
-      isGeneratingRef.current = false;
-      setIsGenerating(false);
-      generationCancellationJobIdRef.current = null;
+      submissionKeys.forEach((key) => submittingGenerationKeysRef.current.delete(key));
+      setSubmittingGenerationKeys((current) => current.filter((key) => !submissionKeys.includes(key)));
     }
   }
 
-  async function ensureGenerationPreflight(tasks: GenerationTask[]): Promise<GenerationPreflightResponse> {
-    if (!currentProjectId) {
-      throw new Error(t("empty.noProjectAction"));
-    }
-    let preflight = await generationPreflight(currentProjectId, tasks);
+  async function ensureGenerationPreflight(projectId: string, tasks: GenerationTask[]): Promise<GenerationPreflightResponse> {
+    let preflight = await generationPreflight(projectId, tasks);
     setPreflightResult(preflight);
     await refreshLoadStatesForPreflight(preflight);
     if (preflight.status === "ready") return preflight;
@@ -1926,7 +1930,7 @@ export default function App() {
         }
         setNotice(t("notice.fallbackStarted"));
         await refreshTopology();
-        preflight = await generationPreflight(currentProjectId, tasks);
+        preflight = await generationPreflight(projectId, tasks);
         setPreflightResult(preflight);
         await refreshLoadStatesForPreflight(preflight);
       } catch (error) {
@@ -1956,52 +1960,6 @@ export default function App() {
     });
   }
 
-  async function runSelectedQueue() {
-    if (selectedLines.length === 0) return;
-    await runQueue(selectedLines);
-  }
-
-  async function pollGenerationJob(jobId: string, runToken: number): Promise<GenerationJob | null> {
-    for (let attempt = 0; attempt < 240; attempt += 1) {
-      if (runToken !== generationRunTokenRef.current) return null;
-      const job = await fetchGenerationJob(jobId);
-      if (runToken !== generationRunTokenRef.current) return null;
-      setActiveJob((current) => reconcileGenerationJobSnapshot(
-        current,
-        job,
-        generationCancellationJobIdRef.current === jobId,
-      ));
-      if (isTerminalGenerationStatus(job.status)) return job;
-      await new Promise((resolve) => window.setTimeout(resolve, 1000));
-    }
-    throw new Error(t("notice.jobTimeout"));
-  }
-
-  async function cancelGeneration() {
-    const jobId = activeJob?.job_id;
-    if (!jobId || generationCancellationJobIdRef.current === jobId || isTerminalGenerationStatus(activeJob.status)) return;
-    try {
-      const cancelled = await cancelGenerationJob(jobId);
-      const cancellationAccepted = cancelled.status === "cancelling" || cancelled.status === "cancelled";
-      generationCancellationJobIdRef.current = cancellationAccepted ? jobId : null;
-      setActiveJob((current) => reconcileGenerationJobSnapshot(
-        current,
-        cancelled,
-        cancellationAccepted,
-      ));
-      if (cancellationAccepted) {
-        setNotice(t("notice.generationCancelling"), { level: "warning" });
-      } else {
-        const terminalNotice = generationTerminalNotice(cancelled.status);
-        if (terminalNotice) {
-          setNotice(t(terminalNotice.key), { level: terminalNotice.level });
-        }
-      }
-    } catch (error) {
-      setNotice(error instanceof Error ? error.message : t("notice.generationFailed"));
-    }
-  }
-
   async function switchProject(projectId: string): Promise<boolean> {
     const operationToken = currentProjectTransitionOperationTokenRef.current + 1;
     currentProjectTransitionOperationTokenRef.current = operationToken;
@@ -2023,7 +1981,6 @@ export default function App() {
         writeStoredProjectId(projectId);
         return projectId;
       });
-      setSelectedLineIds([]);
       setExpandedLineId(null);
       setSelectedHistoryVersions({});
       setVersionDrafts({});
@@ -2044,7 +2001,6 @@ export default function App() {
     if (resetLineState) {
       setActiveLineId(nextProject.lines[0]?.id ?? "");
       setExpandedLineId(null);
-      setSelectedLineIds([]);
       setSelectedHistoryVersions({});
       setVersionDrafts({});
     }
@@ -2267,7 +2223,6 @@ export default function App() {
     setProject(handoff.project);
     setActiveLineId(handoff.activeLineId);
     setExpandedLineId(handoff.expandedLineId);
-    setSelectedLineIds(handoff.selectedLineIds);
     setSelectedHistoryVersions(handoff.selectedHistoryVersions);
     setVersionDrafts(handoff.versionDrafts);
     setLineTextDrafts(handoff.lineTextDrafts);
@@ -2469,7 +2424,6 @@ export default function App() {
           setManifest(createEmptyManifest(null));
           setActiveLineId("");
           setExpandedLineId(null);
-          setSelectedLineIds([]);
           setSelectedHistoryVersions({});
           setVersionDrafts({});
         }
@@ -2664,12 +2618,6 @@ export default function App() {
       }
     };
     await runQueue([lineFromDraft]);
-  }
-
-  function toggleVisibleSelection() {
-    const visibleIds = displayedLines.map((line) => line.id);
-    const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedLineIds.includes(id));
-    setSelectedLineIds(allVisibleSelected ? selectedLineIds.filter((id) => !visibleIds.includes(id)) : Array.from(new Set([...selectedLineIds, ...visibleIds])));
   }
 
   const scriptManagerPane = (
@@ -3915,30 +3863,7 @@ export default function App() {
                   )}
                 </div>
               </details>
-              {lineWorkbenchState.generationVisible && (
-              <div className="task-actions">
-                {isGenerating && activeJob && (
-                  <span className="generation-progress-inline" aria-label={t("queue.progressLabel", { percent: Math.round((activeJob.progress ?? 0) * 100) })}>
-                    {t("queue.progressLabel", { percent: Math.round((activeJob.progress ?? 0) * 100) })}
-                  </span>
-                )}
-                {isGenerating && activeJob ? (
-                  <button
-                    aria-label={activeJobCancellationRequested ? t("status.cancelling") : t("actions.cancel")}
-                    className="secondary-button cancel-button"
-                    disabled={activeJobCancellationRequested || isTerminalGenerationStatus(activeJob.status)}
-                    onClick={() => void cancelGeneration()}
-                    title={activeJobCancellationRequested ? t("status.cancelling") : t("actions.cancel")}
-                  >
-                    <X size={15} /> {activeJobCancellationRequested ? t("status.cancelling") : t("actions.cancel")}
-                  </button>
-                ) : (
-                  <button className="primary-button" onClick={() => void runSelectedQueue()} disabled={isGenerating || selectedLineIds.length === 0}>
-                    <RefreshCw size={15} /> {t("app.queueSelected")}
-                  </button>
-                )}
-              </div>
-              )}
+              <QueueDropdown jobs={queueJobs} currentProjectId={currentProjectId} lineLabels={queueLineLabels} />
             </div>
             )}
             {lineWorkbenchState.roleStripVisible && (
@@ -3980,12 +3905,13 @@ export default function App() {
             <div className="line-table line-card-list">
               {displayedLines.map((line) => {
                 const summary = summarizeLineHistory(lineHistoryForLine(manifest, line));
-                const queueItem = activeJob?.items.find((item) => item.line_uid ? item.line_uid === (line.line_uid ?? line.id) : item.line_id === line.id);
+                const queueItem = latestQueueItemForLine(queueJobs, currentProjectId, line);
                 const visibleTone = queueItem ? generationStatusTone(queueItem.status) : summary.tone;
                 const visibleLabel = queueItem ? t(generationStatusKey(queueItem.status)) : summaryLabel(summary, t);
-                const selected = selectedLineIds.includes(line.id);
                 const rowBinding = lineBinding(line, resolvedCharacters);
                 const canGenerateLine = Boolean(rowBinding);
+                const lineSubmitting = Boolean(currentProjectId && submittingGenerationKeys.includes(generationLineKey(currentProjectId, line)));
+                const lineGenerationBusy = lineSubmitting || lineHasActiveGeneration(queueJobs, currentProjectId, line);
                 const historyVersions = lineHistoryForLine(manifest, line)?.versions ?? [];
                 const roleIndex = Math.max(0, projectRoleRows.findIndex((role) => role.id === line.character_id));
                 const roleRow = projectRoleRows[roleIndex];
@@ -4005,14 +3931,6 @@ export default function App() {
                     onClick={() => focusLine(line.id)}
                   >
                     <div className="line-primary-row">
-                      <label className="line-check" onClick={(event) => event.stopPropagation()}>
-                        <input
-                          type="checkbox"
-                          aria-label={`${t("actions.select")} · ${characterName(resolvedCharacters, line.character_id)} · ${line.text}`}
-                          checked={selected}
-                          onChange={() => setSelectedLineIds((current) => toggleLineSelection(current, line.id))}
-                        />
-                      </label>
                       <div className="line-speaker">
                         <RoleAvatar avatarPath={roleRow?.avatarPath} fallback={roleRow?.avatarFallback ?? avatarFallback(characterName(resolvedCharacters, line.character_id))} size="md" />
                         <strong>{characterName(resolvedCharacters, line.character_id)}</strong>
@@ -4050,7 +3968,9 @@ export default function App() {
                       {!canGenerateLine && <span className="line-meta-chip attention">{t("status.needsSetup")}</span>}
                       <span className="row-actions">
                         <button className="icon-button tiny" onClick={(event) => { event.stopPropagation(); playLine(line); }} title={t("actions.playLatest")}><Play size={14} /></button>
-                        <button className="icon-button tiny" disabled={!canGenerateLine || isGenerating} onClick={(event) => { event.stopPropagation(); void runQueue([line]); }} title={canGenerateLine ? t("actions.regenerate") : t("inspector.needsTemporaryBinding")}><RefreshCw size={14} /></button>
+                        <button className="icon-button tiny" disabled={!canGenerateLine || lineGenerationBusy} onClick={(event) => { event.stopPropagation(); void runQueue([line]); }} title={canGenerateLine ? t("actions.regenerate") : t("inspector.needsTemporaryBinding")}>
+                          {lineGenerationBusy ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />}
+                        </button>
                       </span>
                     </div>
                     {queueItem && <div className="line-progress"><span style={{ width: `${Math.round(queueItem.progress * 100)}%` }} /></div>}
@@ -4731,8 +4651,8 @@ export default function App() {
                     </div>
                   )}
                   <div className="generate-dock-actions">
-                    <button className="primary-button inspector-generate-button" onClick={() => void runInspectorGeneration()} disabled={isGenerating || (!activeVersionDraft && !activeBinding)}>
-                      {isGenerating ? <Loader2 className="spin" size={15} /> : <RefreshCw size={15} />}
+                    <button className="primary-button inspector-generate-button" onClick={() => void runInspectorGeneration()} disabled={activeLineGenerationBusy || (!activeVersionDraft && !activeBinding)}>
+                      {activeLineGenerationBusy ? <Loader2 className="spin" size={15} /> : <RefreshCw size={15} />}
                       {activeVersionDraft ? t("inspector.generateFromVersion") : activeSummary.tone === "completed" ? t("actions.regenerate") : t("inspector.generateLine")}
                     </button>
                   </div>

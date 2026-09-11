@@ -1,7 +1,5 @@
 import type { ReactNode } from "react";
 
-import "./line-workspace.css";
-
 export interface LineWorkspaceProps {
   lineList: ReactNode;
   inspector: ReactNode;
