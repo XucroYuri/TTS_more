@@ -397,6 +397,66 @@ describe("App semantic analysis entry", () => {
     expect(view.container.querySelector(".analysis-history-popover")?.textContent).toContain("暂无分析记录");
   });
 
+  it("reuses analysis history in semantic review and exits when the current run is deleted", async () => {
+    const projectId = "review-history-project";
+    backendProjects.set(projectId, scriptProject("审阅历史剧本"));
+    const runs = new Map<string, AnalysisRun>();
+    const drafts = new Map<string, SemanticAnalysisDraft>();
+    apiMocks.createAnalysisRun.mockImplementation(async (targetProjectId: string, revisionId: string) => {
+      const currentRun = completedRun(targetProjectId, revisionId);
+      const currentDraft = analysisDraft(targetProjectId, revisionId);
+      runs.set(currentRun.id, currentRun);
+      drafts.set(currentDraft.id, currentDraft);
+      return {
+        run_id: currentRun.id,
+        draft_id: currentRun.draft_id,
+        status: currentRun.status,
+        trace_id: currentRun.trace_id
+      };
+    });
+    apiMocks.fetchAnalysisRun.mockImplementation(async (runId: string) => runs.get(runId)!);
+    apiMocks.fetchAnalysisDraft.mockImplementation(async (draftId: string) => drafts.get(draftId)!);
+    apiMocks.fetchAnalysisHistory.mockImplementation(async () => ({
+      runs: [...runs.values()].map((item) => ({
+        run_id: item.id,
+        draft_id: item.draft_id,
+        project_id: item.project_id,
+        project_title: "审阅历史剧本",
+        source_revision_id: item.source_revision_id,
+        status: item.status,
+        progress: item.progress,
+        error_code: item.error?.code ?? null,
+        created_at: item.created_at,
+        updated_at: item.updated_at
+      }))
+    }));
+    apiMocks.deleteAnalysisRun.mockImplementation(async (runId: string) => ({
+      deleted_run_id: runId,
+      deleted_draft_id: runs.get(runId)!.draft_id
+    }));
+    const view = await renderApp(projectId);
+    await flushAsync();
+
+    await changeReactValueExact(
+      view.container.querySelector<HTMLTextAreaElement>(".script-manager-source-editor")!,
+      "旁白：进入语义分析审阅"
+    );
+    await click(view.container.querySelector('[data-action="analyze-script"]')!);
+    await flushAsync(40);
+
+    expect(view.container.querySelector(".script-analysis-workspace")).not.toBeNull();
+    await click(view.container.querySelector('[data-action="analysis-history"]')!);
+    await flushAsync();
+    expect(view.container.querySelector(".analysis-history-popover")?.textContent).toContain("审阅历史剧本");
+
+    await click(view.container.querySelector(".analysis-history-row .icon-button.danger")!);
+    await click(view.container.querySelector(".confirm-modal .primary-button")!);
+    await flushAsync();
+
+    expect(apiMocks.deleteAnalysisRun).toHaveBeenCalledWith(`run-${projectId}`);
+    expect(view.container.querySelector(".script-analysis-workspace")).toBeNull();
+  });
+
   it("loads portable logs references when a GPT-SoVITS binding has no logs_name", async () => {
     const projectId = "project-gpt-logs-root";
     const project = scriptProject("GPT logs root");

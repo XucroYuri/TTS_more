@@ -157,6 +157,7 @@ import { buildComfyUIEndpointRequest, ttsAudioSuiteContractForProvider } from ".
 import { createToast, inferToastLevel, shouldToastNotice, toastDuration, type Toast, type ToastLevel, type ToastOptions } from "./lib/toast";
 import { generationMethodForProvider, generationMethodOptions, generationMethodRouteLabels, historyPlayerSummary, inspectorBackupReferenceVisible, inspectorDiagnosticsState, inspectorPanelMode, inspectorSections, lineCardSecondaryBadges, lineFilterToolbarState, lineFocusTransition, lineWorkbenchControlsState, preflightFallbackAction, preflightLineLabelKey, preflightLineTone, preflightLoadLabelKey, preflightLoadTone, roleAccentClass, shouldRequestRevisionConfirmation, trustedBackupReferenceGroups, type GenerationMethodId, type LineCardSecondaryBadge } from "./lib/workbenchView";
 import type {
+  AnalysisHistoryItem,
   Character,
   CharacterReferenceAudioGroup,
   GenerationManifest,
@@ -439,6 +440,17 @@ export default function App() {
     confirmationResolverRef.current?.(confirmed);
     confirmationResolverRef.current = null;
     setConfirmationDialog(null);
+  }
+
+  function confirmAnalysisHistoryDeletion(item: AnalysisHistoryItem): Promise<boolean> {
+    return requestConfirmation({
+      title: t("analysisHistory.deleteTitle"),
+      body: t("analysisHistory.deleteBody", { title: item.project_title }),
+      detail: t("analysisHistory.deleteDetail"),
+      confirmLabel: t("analysisHistory.delete"),
+      cancelLabel: t("actions.cancel"),
+      tone: "danger"
+    });
   }
 
   function markWorkspaceAuthoritative(
@@ -2783,6 +2795,7 @@ export default function App() {
           controllerOptions={{
             mode: analysisConfirmedReviewRef.current ? "review" : "analyze"
           }}
+          onDeleteAnalysisHistoryRequest={confirmAnalysisHistoryDeletion}
           ttsWorkbench={(
             <>
         <header className="topbar">
@@ -2801,14 +2814,7 @@ export default function App() {
             </button>
             <AnalysisHistoryDropdown
               onOpen={() => setIsTopologyMenuOpen(false)}
-              onDeleteRequest={(item) => requestConfirmation({
-                title: t("analysisHistory.deleteTitle"),
-                body: t("analysisHistory.deleteBody", { title: item.project_title }),
-                detail: t("analysisHistory.deleteDetail"),
-                confirmLabel: t("analysisHistory.delete"),
-                cancelLabel: t("actions.cancel"),
-                tone: "danger"
-              })}
+              onDeleteRequest={confirmAnalysisHistoryDeletion}
             />
             <div className="topbar-menu-wrap topbar-config-actions">
               <button

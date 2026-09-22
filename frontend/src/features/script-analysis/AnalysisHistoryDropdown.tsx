@@ -9,6 +9,7 @@ import { defaultAnalysisStorage, removeDeletedAnalysisSession } from "./analysis
 interface AnalysisHistoryDropdownProps {
   onOpen?: () => void;
   onDeleteRequest: (item: AnalysisHistoryItem) => Promise<boolean>;
+  onDeleted?: (item: AnalysisHistoryItem) => void;
 }
 
 const activeStatuses = new Set<AnalysisRunStatus>(["queued", "running"]);
@@ -35,7 +36,7 @@ function formatAnalysisTime(value: string, language: string): string {
   }).format(date);
 }
 
-export function AnalysisHistoryDropdown({ onOpen, onDeleteRequest }: AnalysisHistoryDropdownProps) {
+export function AnalysisHistoryDropdown({ onOpen, onDeleteRequest, onDeleted }: AnalysisHistoryDropdownProps) {
   const { t, i18n } = useTranslation();
   const [open, setOpen] = useState(false);
   const [items, setItems] = useState<AnalysisHistoryItem[]>([]);
@@ -88,6 +89,7 @@ export function AnalysisHistoryDropdown({ onOpen, onDeleteRequest }: AnalysisHis
       const deleted = await deleteAnalysisRun(item.run_id);
       removeDeletedAnalysisSession(deleted.deleted_run_id, deleted.deleted_draft_id, defaultAnalysisStorage());
       setItems((current) => current.filter((candidate) => candidate.run_id !== item.run_id));
+      onDeleted?.(item);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : t("analysisHistory.deleteFailed"));
     } finally {

@@ -1,7 +1,7 @@
 import { createElement, Fragment, type ReactNode } from "react";
 
 import { createScriptRevision } from "../../api";
-import type { ScriptProject, ScriptRevision } from "../../types";
+import type { AnalysisHistoryItem, ScriptProject, ScriptRevision } from "../../types";
 import { readScriptFile, type ScriptFileInput } from "./fileInput";
 import { ScriptAnalysisWorkspace } from "./ScriptAnalysisWorkspace";
 import { activeAnalysisScopeForRevision, type ActiveAnalysisScope } from "./analysisSessionStorage";
@@ -160,6 +160,7 @@ export interface AnalysisStageGateProps {
   onConfirmed: (project: ScriptProject) => void;
   onCancel: () => void;
   controllerOptions?: UseAnalysisDraftOptions;
+  onDeleteAnalysisHistoryRequest?: (item: AnalysisHistoryItem) => Promise<boolean>;
   ttsWorkbench: ReactNode;
 }
 
@@ -170,6 +171,7 @@ export function AnalysisStageGate({
   onConfirmed,
   onCancel,
   controllerOptions,
+  onDeleteAnalysisHistoryRequest,
   ttsWorkbench
 }: AnalysisStageGateProps) {
   if (stage === "analysis" && projectId && sourceRevision) {
@@ -179,7 +181,8 @@ export function AnalysisStageGate({
       sourceRevision,
       onConfirmed,
       onCancel,
-      controllerOptions
+      controllerOptions,
+      onDeleteAnalysisHistoryRequest
     });
   }
   return createElement(Fragment, null, ttsWorkbench);

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import type {
+  AnalysisHistoryItem,
   AnalysisError,
   DraftOperation,
   ScriptProject,
@@ -11,6 +12,7 @@ import type {
   UnresolvedCandidate
 } from "../../types";
 import { AnalysisResultsPane, type AnalysisResultFilter } from "./AnalysisResultsPane";
+import { AnalysisHistoryDropdown } from "./AnalysisHistoryDropdown";
 import {
   AnalysisBlockingDialog,
   AnalysisLoadingState,
@@ -34,6 +36,7 @@ export interface ScriptAnalysisWorkspaceProps {
   createCharacterId?: () => string;
   createUtteranceId?: () => string;
   copyDiagnostics?: (diagnostics: string) => void | Promise<void>;
+  onDeleteAnalysisHistoryRequest?: (item: AnalysisHistoryItem) => Promise<boolean>;
 }
 
 export interface ConfirmableUtteranceSummary {
@@ -97,7 +100,8 @@ export function ScriptAnalysisWorkspace({
   controllerOptions,
   createCharacterId,
   createUtteranceId = defaultCreateUtteranceId,
-  copyDiagnostics
+  copyDiagnostics,
+  onDeleteAnalysisHistoryRequest
 }: ScriptAnalysisWorkspaceProps) {
   const { t, i18n } = useTranslation();
   const controller = useAnalysisDraft(projectId, sourceRevision, controllerOptions);
@@ -293,6 +297,14 @@ export function ScriptAnalysisWorkspace({
         </div>
 
         <div className="script-analysis-workspace__topbar-actions">
+          {onDeleteAnalysisHistoryRequest ? (
+            <AnalysisHistoryDropdown
+              onDeleteRequest={onDeleteAnalysisHistoryRequest}
+              onDeleted={(item) => {
+                if (item.run_id === controller.run?.id) onCancel();
+              }}
+            />
+          ) : null}
           <AnalysisNotifications
             warnings={visibleWarnings}
             warningSource={draft ? "draft" : "run"}
