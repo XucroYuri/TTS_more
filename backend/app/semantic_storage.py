@@ -218,6 +218,68 @@ class SemanticStore:
                 raise SemanticNotFoundError("draft_not_found")
             return draft
 
+    def list_runs(self) -> list[AnalysisRun]:
+        """Return every indexed run that still has a readable sidecar."""
+        index = self._load_index()
+        grouped: dict[str, list[str]] = {}
+        for run_id, metadata in index["runs"].items():
+            if not isinstance(run_id, str) or not isinstance(metadata, dict):
+                continue
+            project_id = metadata.get("project_id")
+            if not isinstance(project_id, str):
+                continue
+            try:
+                safe_project_id = self._safe_project_id(project_id)
+                safe_run_id = self._safe_id(run_id)
+            except ValueError:
+                continue
+            grouped.setdefault(safe_project_id, []).append(safe_run_id)
+
+        runs: list[AnalysisRun] = []
+        for project_id, run_ids in grouped.items():
+            with self.project_store.project_lock(project_id):
+                for run_id in run_ids:
+                    try:
+                        run = self._read_model(self._run_path(project_id, run_id), AnalysisRun)
+                    except (SemanticNotFoundError, ValueError, OSError):
+                        continue
+                    if run.id == run_id and run.project_id == project_id:
+                        runs.append(run)
+        return sorted(runs, key=lambda item: (item.updated_at, item.created_at, item.id), reverse=True)
+
+    def delete_run(self, run_id: str) -> tuple[AnalysisRun, str]:
+        """Delete one analysis cache entry without removing confirmed revisions."""
+        safe_run_id = self._safe_id(run_id)
+        project_id = self._project_for("runs", safe_run_id)
+        with self.project_store.project_lock(project_id):
+            run = self._read_model(self._run_path(project_id, safe_run_id), AnalysisRun)
+            if run.id != safe_run_id or run.project_id != project_id:
+                raise SemanticNotFoundError("run_not_found")
+            draft_id = self._safe_id(run.draft_id)
+            with self._index_lock():
+                index = self._load_index()
+                run_metadata = index["runs"].get(safe_run_id)
+                if (
+                    not isinstance(run_metadata, dict)
+                    or run_metadata.get("project_id") != project_id
+                    or run_metadata.get("draft_id") != draft_id
+                ):
+                    raise SemanticNotFoundError("run_not_found")
+                index["runs"].pop(safe_run_id, None)
+                draft_metadata = index["drafts"].get(draft_id)
+                if (
+                    isinstance(draft_metadata, dict)
+                    and draft_metadata.get("project_id") == project_id
+                    and draft_metadata.get("run_id") == safe_run_id
+                ):
+                    index["drafts"].pop(draft_id, None)
+                # Remove the index entry first. Background workers must no longer
+                # be able to persist a result after the user deletes this run.
+                self._write_index(index)
+            windows_filesystem_path(self._run_path(project_id, safe_run_id)).unlink(missing_ok=True)
+            windows_filesystem_path(self._draft_path(project_id, draft_id)).unlink(missing_ok=True)
+            return run, draft_id
+
     def load_latest_confirmed_review_session(
         self,
         project_id: str,
@@ -287,6 +349,10 @@ class SemanticStore:
         if project_id != run.project_id:
             raise SemanticValidationError()
         with self.project_store.project_lock(project_id):
+            # Revalidate while holding the project lock so delete_run cannot
+            # remove the index and then have an in-flight worker recreate it.
+            if self._project_for("runs", run.id) != project_id:
+                raise SemanticNotFoundError("run_not_found")
             self._write_model(self._run_path(project_id, run.id), self._touch(run))
 
     def transition_incomplete_run_to_interrupted(self, run_id: str) -> AnalysisRun | None:

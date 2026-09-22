@@ -38,7 +38,32 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       resourceQueue: "队列",
       services: "服务",
       ttsConfig: "接入",
-      llmConfig: "解析"
+      llmConfig: "解析",
+      analysisHistory: "历史分析"
+    },
+    analysisHistory: {
+      title: "历史分析",
+      count: "{{count}} 条记录",
+      scriptName: "剧本名字",
+      analysisTime: "分析时间",
+      status: "分析状态",
+      actions: "操作",
+      loading: "正在读取分析记录…",
+      empty: "暂无分析记录",
+      loadFailed: "读取历史分析失败",
+      delete: "删除",
+      deleteItem: "删除《{{title}}》的分析记录",
+      deleteTitle: "删除分析记录",
+      deleteBody: "确定删除《{{title}}》的这条分析记录吗？",
+      deleteDetail: "运行中、排队中、成功或失败的记录都可以删除；已应用到剧本的台词不会被删除。",
+      deleteFailed: "删除分析记录失败",
+      statuses: {
+        queued: "排队中",
+        running: "进行中",
+        completed: "成功",
+        failed: "失败",
+        interrupted: "已中断"
+      }
     },
     audioInput: {
       upload: "上传",
@@ -1081,7 +1106,32 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       resourceQueue: "Queue",
       services: "Services",
       ttsConfig: "Access",
-      llmConfig: "Parse"
+      llmConfig: "Parse",
+      analysisHistory: "Analysis history"
+    },
+    analysisHistory: {
+      title: "Analysis history",
+      count: "{{count}} records",
+      scriptName: "Script",
+      analysisTime: "Analysis time",
+      status: "Status",
+      actions: "Actions",
+      loading: "Loading analysis records…",
+      empty: "No analysis records",
+      loadFailed: "Failed to load analysis history",
+      delete: "Delete",
+      deleteItem: "Delete the analysis record for {{title}}",
+      deleteTitle: "Delete analysis record",
+      deleteBody: "Delete this analysis record for {{title}}?",
+      deleteDetail: "Running, queued, successful, and failed records can all be deleted. Lines already applied to the script are preserved.",
+      deleteFailed: "Failed to delete analysis record",
+      statuses: {
+        queued: "Queued",
+        running: "Running",
+        completed: "Succeeded",
+        failed: "Failed",
+        interrupted: "Interrupted"
+      }
     },
     audioInput: {
       upload: "Upload",

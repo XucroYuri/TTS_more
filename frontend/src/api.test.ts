@@ -230,6 +230,35 @@ describe("semantic analysis API request shapes", () => {
     expect(requestedUrl).toBe("/api/projects/demo%2Fproject/analysis-review-session");
   });
 
+  it("lists and deletes analysis history through the global history endpoints", async () => {
+    const originalFetch = globalThis.fetch;
+    const calls: Array<{ url: string; method: string | undefined }> = [];
+    const responses = [
+      { runs: [] },
+      { deleted_run_id: "run/1", deleted_draft_id: "draft-1" }
+    ];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(input), method: init?.method });
+      return new Response(JSON.stringify(responses.shift()), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    }) as typeof fetch;
+
+    try {
+      const api = await import("./api");
+      await api.fetchAnalysisHistory();
+      await api.deleteAnalysisRun("run/1");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    expect(calls).toEqual([
+      { url: "/api/analysis-runs", method: undefined },
+      { url: "/api/analysis-runs/run%2F1", method: "DELETE" }
+    ]);
+  });
+
   it("retains the real HTTP status and response body for semantic conflicts", async () => {
     const originalFetch = globalThis.fetch;
     const responseBody = JSON.stringify({

@@ -115,6 +115,7 @@ import {
   type WorkspaceStage
 } from "./features/script-analysis/analysisFlow";
 import { scriptTitleFromFilename, type ScriptFileTarget } from "./features/script-analysis/fileInput";
+import { AnalysisHistoryDropdown } from "./features/script-analysis/AnalysisHistoryDropdown";
 import {
   activeAnalysisScopeForRevision,
   activeAnalysisScopeMatchesRevision,
@@ -126,6 +127,7 @@ import {
 } from "./features/script-analysis/useAnalysisDraft";
 import {
   analysisScopeStorageId,
+  clearLegacyAnalysisCacheOnce,
   defaultAnalysisStorage,
   writeAnalysisRunSession
 } from "./features/script-analysis/analysisSessionStorage";
@@ -259,6 +261,7 @@ function mergeVoiceSelectionAuthority(
 }
 
 export default function App() {
+  clearLegacyAnalysisCacheOnce();
   const { t, i18n } = useTranslation();
   const [currentProjectId, setCurrentProjectId] = useState<string | null>(() => readStoredProjectId());
   const [projectSummaries, setProjectSummaries] = useState<ProjectSummary[]>([]);
@@ -2796,6 +2799,17 @@ export default function App() {
               {isReturningToAnalysis ? <Loader2 className="spin" size={15} /> : <ArrowLeft size={15} />}
               <span className="menu-trigger-label">{t("app.reviewConfirmedAnnotations")}</span>
             </button>
+            <AnalysisHistoryDropdown
+              onOpen={() => setIsTopologyMenuOpen(false)}
+              onDeleteRequest={(item) => requestConfirmation({
+                title: t("analysisHistory.deleteTitle"),
+                body: t("analysisHistory.deleteBody", { title: item.project_title }),
+                detail: t("analysisHistory.deleteDetail"),
+                confirmLabel: t("analysisHistory.delete"),
+                cancelLabel: t("actions.cancel"),
+                tone: "danger"
+              })}
+            />
             <div className="topbar-menu-wrap topbar-config-actions">
               <button
                 className={`topbar-action-button menu-trigger service-status-trigger tone-${serviceSummary.parser.tone} ${servicePanelSection === "llm" && isTopologyMenuOpen ? "active" : ""}`}

@@ -160,6 +160,39 @@ def test_analysis_run_is_nonblocking_completes_and_persists_across_app_restart(t
         assert persisted.json() == terminal
 
 
+def test_analysis_history_lists_titles_and_can_delete_a_running_run(tmp_path: Path) -> None:
+    _semantic_api()
+    gate = threading.Event()
+    service = FakeSemanticService(gate=gate)
+    app = _app(tmp_path, service)
+
+    with TestClient(app) as client:
+        created = _create_run(client)
+        assert service.started.wait(1)
+
+        history = client.get("/api/analysis-runs")
+        assert history.status_code == 200
+        item = next(entry for entry in history.json()["runs"] if entry["run_id"] == created["run_id"])
+        assert item["project_title"] == "Semantic API demo"
+        assert item["status"] == "running"
+        assert item["draft_id"] == created["draft_id"]
+
+        deleted = client.delete(f"/api/analysis-runs/{created['run_id']}")
+        assert deleted.status_code == 200
+        assert deleted.json() == {
+            "deleted_run_id": created["run_id"],
+            "deleted_draft_id": created["draft_id"],
+        }
+        assert client.get(f"/api/analysis-runs/{created['run_id']}").status_code == 404
+        assert client.get(f"/api/analysis-drafts/{created['draft_id']}").status_code == 404
+        assert client.get("/api/analysis-runs").json()["runs"] == []
+
+        gate.set()
+        assert service.finished.wait(1)
+        time.sleep(0.05)
+        assert client.get(f"/api/analysis-runs/{created['run_id']}").status_code == 404
+
+
 def test_partial_chunk_warning_sets_partial_quality(tmp_path: Path) -> None:
     _semantic_api()
     with TestClient(_app(tmp_path, FakeSemanticService(partial=True))) as client:

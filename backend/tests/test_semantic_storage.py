@@ -228,6 +228,44 @@ def test_create_run_and_draft_persists_constrained_sidecars_and_reverse_index(pr
     assert index["drafts"][draft.id] == {"project_id": "demo", "run_id": run.id}
 
 
+@pytest.mark.parametrize(
+    "status",
+    [
+        AnalysisRunStatus.QUEUED,
+        AnalysisRunStatus.RUNNING,
+        AnalysisRunStatus.COMPLETED,
+        AnalysisRunStatus.FAILED,
+        AnalysisRunStatus.INTERRUPTED,
+    ],
+)
+def test_list_and_delete_run_support_every_status_and_prevent_worker_recreation(
+    project_store: ProjectStore,
+    status: AnalysisRunStatus,
+) -> None:
+    store = SemanticStore(project_store)
+    run, draft = store.create_run_and_draft("demo", "script-r001", trace_id=f"trace-{status.value}")
+    run = run.model_copy(
+        update={
+            "status": status,
+            "quality": AnalysisRunQuality.COMPLETE if status is AnalysisRunStatus.COMPLETED else None,
+        }
+    )
+    store.save_run(run)
+
+    assert [item.id for item in store.list_runs()] == [run.id]
+
+    deleted, deleted_draft_id = store.delete_run(run.id)
+
+    assert deleted.status is status
+    assert deleted_draft_id == draft.id
+    assert store.list_runs() == []
+    assert not (project_store.project_semantic_dir("demo") / "runs" / f"{run.id}.json").exists()
+    assert not (project_store.project_semantic_dir("demo") / "drafts" / f"{draft.id}.json").exists()
+    with pytest.raises(SemanticNotFoundError, match="run_not_found"):
+        store.save_run(run)
+    assert not (project_store.project_semantic_dir("demo") / "runs" / f"{run.id}.json").exists()
+
+
 def test_create_run_and_draft_rejects_legacy_oversized_source_without_writes(tmp_path: Path) -> None:
     _storage()
     project_store = ProjectStore(tmp_path)

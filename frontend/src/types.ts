@@ -530,6 +530,19 @@ export interface AnalysisRun {
   updated_at: string;
 }
 
+export interface AnalysisHistoryItem {
+  run_id: string;
+  draft_id: string;
+  project_id: string;
+  project_title: string;
+  source_revision_id: string;
+  status: AnalysisRunStatus;
+  progress: number;
+  error_code: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface SemanticAnalysisDraft {
   id: string;
   project_id: string;

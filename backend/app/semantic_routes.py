@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 from app.semantic_executor import SemanticAnalysisExecutor
 from app.semantic_logging import SemanticEventLogger
+from app.semantic_models import AnalysisRunStatus
 from app.semantic_storage import (
     DraftOperation,
     SemanticConflictError,
@@ -41,6 +42,19 @@ class AnalysisReviewSessionResponse(BaseModel):
     run_id: str
     draft_id: str
     source_revision_id: str
+
+
+class AnalysisHistoryItem(BaseModel):
+    run_id: str
+    draft_id: str
+    project_id: str
+    project_title: str
+    source_revision_id: str
+    status: AnalysisRunStatus
+    progress: float
+    error_code: str | None = None
+    created_at: str
+    updated_at: str
 
 
 def _http_error(exc: Exception) -> HTTPException:
@@ -117,6 +131,41 @@ def build_semantic_router(
     def get_analysis_run(run_id: str):
         try:
             return semantic_store.load_run(run_id)
+        except Exception as exc:
+            raise _http_error(exc) from exc
+
+    @router.get("/analysis-runs", response_model=dict[str, list[AnalysisHistoryItem]])
+    def list_analysis_runs() -> dict[str, list[AnalysisHistoryItem]]:
+        try:
+            titles = {
+                str(item["project_id"]): str(item["title"])
+                for item in project_store.list_projects()
+            }
+            return {
+                "runs": [
+                    AnalysisHistoryItem(
+                        run_id=run.id,
+                        draft_id=run.draft_id,
+                        project_id=run.project_id,
+                        project_title=titles.get(run.project_id, run.project_id),
+                        source_revision_id=run.source_revision_id,
+                        status=run.status,
+                        progress=run.progress,
+                        error_code=run.error.code if run.error else None,
+                        created_at=run.created_at.isoformat(),
+                        updated_at=run.updated_at.isoformat(),
+                    )
+                    for run in semantic_store.list_runs()
+                ]
+            }
+        except Exception as exc:
+            raise _http_error(exc) from exc
+
+    @router.delete("/analysis-runs/{run_id}")
+    def delete_analysis_run(run_id: str) -> dict[str, str]:
+        try:
+            run, draft_id = semantic_store.delete_run(run_id)
+            return {"deleted_run_id": run.id, "deleted_draft_id": draft_id}
         except Exception as exc:
             raise _http_error(exc) from exc
 

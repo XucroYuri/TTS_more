@@ -14,6 +14,8 @@ import type {
   SemanticConfirmResponse
 } from "./types";
 import {
+  ANALYSIS_CACHE_RESET_STORAGE_KEY,
+  ANALYSIS_CACHE_RESET_VERSION,
   ANALYSIS_REVIEW_SESSIONS_STORAGE_KEY,
   ANALYSIS_RUN_SESSIONS_STORAGE_KEY
 } from "./features/script-analysis/useAnalysisDraft";
@@ -41,6 +43,8 @@ const apiMocks = vi.hoisted(() => ({
   createParseRevision: vi.fn(),
   createAnalysisRun: vi.fn(),
   fetchAnalysisReviewSession: vi.fn(),
+  fetchAnalysisHistory: vi.fn(),
+  deleteAnalysisRun: vi.fn(),
   fetchAnalysisRun: vi.fn(),
   fetchAnalysisDraft: vi.fn(),
   patchAnalysisDraft: vi.fn(),
@@ -254,6 +258,8 @@ function resetApiDefaults(): void {
   apiMocks.fetchManifest.mockImplementation(async (projectId: string) => ({ project_id: projectId, lines: {} }));
   apiMocks.fetchParserProviders.mockImplementation(async () => ({ providers: [] }));
   apiMocks.fetchCharacters.mockImplementation(async () => []);
+  apiMocks.fetchAnalysisHistory.mockImplementation(async () => ({ runs: [] }));
+  apiMocks.deleteAnalysisRun.mockImplementation(async (runId: string) => ({ deleted_run_id: runId, deleted_draft_id: "draft-deleted" }));
   apiMocks.saveProject.mockImplementation(async (projectId: string, project: ScriptProject) => {
     backendProjects.set(projectId, cloneProject(project));
   });
@@ -297,6 +303,7 @@ async function renderApp(
     IS_REACT_ACT_ENVIRONMENT: true
   });
   if (storedProjectId) dom.window.localStorage.setItem("tts-more.currentProjectId", storedProjectId);
+  dom.window.localStorage.setItem(ANALYSIS_CACHE_RESET_STORAGE_KEY, ANALYSIS_CACHE_RESET_VERSION);
   setupStorage?.(dom.window.localStorage);
   const container = dom.window.document.getElementById("root")!;
   const root = createRoot(container);
@@ -354,6 +361,42 @@ afterEach(async () => {
 });
 
 describe("App semantic analysis entry", () => {
+  it("shows global analysis history and deletes records of any status", async () => {
+    const projectId = "history-project";
+    backendProjects.set(projectId, scriptProject("历史剧本"));
+    apiMocks.fetchAnalysisHistory.mockResolvedValue({
+      runs: [{
+        run_id: "run-history",
+        draft_id: "draft-history",
+        project_id: projectId,
+        project_title: "历史剧本",
+        source_revision_id: "script-r001",
+        status: "running",
+        progress: 0.35,
+        error_code: null,
+        created_at: timestamp,
+        updated_at: timestamp
+      }]
+    });
+    apiMocks.deleteAnalysisRun.mockResolvedValue({ deleted_run_id: "run-history", deleted_draft_id: "draft-history" });
+    const view = await renderApp(projectId);
+    await flushAsync();
+
+    await click(view.container.querySelector('[data-action="analysis-history"]')!);
+    await flushAsync();
+
+    expect(view.container.querySelector(".analysis-history-popover")?.textContent).toContain("历史剧本");
+    expect(view.container.querySelector(".analysis-history-popover")?.textContent).toContain("进行中");
+    expect(view.container.querySelector(".analysis-history-popover")?.textContent).toContain("35%");
+
+    await click(view.container.querySelector(".analysis-history-row .icon-button.danger")!);
+    await click(view.container.querySelector(".confirm-modal .primary-button")!);
+    await flushAsync();
+
+    expect(apiMocks.deleteAnalysisRun).toHaveBeenCalledWith("run-history");
+    expect(view.container.querySelector(".analysis-history-popover")?.textContent).toContain("暂无分析记录");
+  });
+
   it("loads portable logs references when a GPT-SoVITS binding has no logs_name", async () => {
     const projectId = "project-gpt-logs-root";
     const project = scriptProject("GPT logs root");

@@ -5,6 +5,8 @@ export const ANALYSIS_RUN_SESSIONS_STORAGE_KEY = "tts-more:analysis-run-sessions
 export const ANALYSIS_REVIEW_SESSIONS_STORAGE_KEY = "tts-more:analysis-review-sessions";
 export const ACTIVE_ANALYSIS_SCOPE_STORAGE_KEY = "tts-more:active-analysis-scope";
 export const ANALYSIS_CONFIRM_KEYS_STORAGE_KEY = "tts-more:analysis-confirm-keys";
+export const ANALYSIS_CACHE_RESET_STORAGE_KEY = "tts-more:analysis-cache-reset";
+export const ANALYSIS_CACHE_RESET_VERSION = "2026-09-22-history-v1";
 
 export interface AnalysisRunSession {
   runId: string;
@@ -22,6 +24,26 @@ export function defaultAnalysisStorage(): Storage | null {
     return typeof window === "undefined" ? null : window.localStorage;
   } catch {
     return null;
+  }
+}
+
+export function clearLegacyAnalysisCacheOnce(storage: Storage | null = defaultAnalysisStorage()): boolean {
+  if (!storage) return false;
+  try {
+    if (storage.getItem(ANALYSIS_CACHE_RESET_STORAGE_KEY) === ANALYSIS_CACHE_RESET_VERSION) return false;
+    for (const key of [
+      ANALYSIS_DISMISSED_RUNS_STORAGE_KEY,
+      ANALYSIS_RUN_SESSIONS_STORAGE_KEY,
+      ANALYSIS_REVIEW_SESSIONS_STORAGE_KEY,
+      ACTIVE_ANALYSIS_SCOPE_STORAGE_KEY,
+      ANALYSIS_CONFIRM_KEYS_STORAGE_KEY,
+    ]) {
+      storage.removeItem(key);
+    }
+    storage.setItem(ANALYSIS_CACHE_RESET_STORAGE_KEY, ANALYSIS_CACHE_RESET_VERSION);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -172,4 +194,33 @@ export function writeAnalysisConfirmKey(storage: Storage | null, draftId: string
   const keys = readObject(storage, ANALYSIS_CONFIRM_KEYS_STORAGE_KEY);
   keys[draftId] = key;
   writeObject(storage, ANALYSIS_CONFIRM_KEYS_STORAGE_KEY, keys);
+}
+
+export function removeDeletedAnalysisSession(
+  runId: string,
+  draftId: string,
+  storage: Storage | null = defaultAnalysisStorage()
+): void {
+  for (const storageKey of [ANALYSIS_RUN_SESSIONS_STORAGE_KEY, ANALYSIS_REVIEW_SESSIONS_STORAGE_KEY]) {
+    const sessions = readObject(storage, storageKey);
+    let changed = false;
+    for (const [scopeId, value] of Object.entries(sessions)) {
+      if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+      const session = value as Record<string, unknown>;
+      if (session.runId === runId || session.draftId === draftId) {
+        delete sessions[scopeId];
+        changed = true;
+      }
+    }
+    if (changed) writeObject(storage, storageKey, sessions);
+  }
+
+  const confirmKeys = readObject(storage, ANALYSIS_CONFIRM_KEYS_STORAGE_KEY);
+  if (draftId in confirmKeys) {
+    delete confirmKeys[draftId];
+    writeObject(storage, ANALYSIS_CONFIRM_KEYS_STORAGE_KEY, confirmKeys);
+  }
+
+  const dismissed = readDismissedAnalysisRuns(storage);
+  if (dismissed.delete(runId)) writeDismissedAnalysisRuns(storage, dismissed);
 }

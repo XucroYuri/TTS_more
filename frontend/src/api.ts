@@ -1,5 +1,5 @@
 import type { CatalogProvider, Character, DemoValidationPlan, GenerationJob, GenerationManifest, GenerationPreflightResponse, GenerationTask, GPTSoVITSModelCatalogResponse, LogsReferenceAudioResponse, OpenSourceTTSCatalogItem, OpenSourceTTSConfigureRequest, OpenSourceTTSDetectRequest, OpenSourceTTSDetectResponse, ParseRevision, ParsedDraft, ParserProviderDraft, ParserProviderTestResponse, ParserProvidersResponse, ParserProvidersSavePayload, ProjectCharactersResponse, ProjectCharacter, ProjectSummary, QueueStatus, ReferenceAudioGroup, RoleLibraryCandidate, RoleLibraryScanResponse, RuntimeMode, ScriptProject, ScriptRevision, ServiceActionResult, ServiceLoadState, ServiceLogResponse, ServiceSettingsPayload, ServiceSettingsResponse, VoiceCandidates, VoiceCatalogPublicView, VoiceCatalogSyncStatus, VoiceIdentityConfirmationResponse, VoiceRecommendation, VoiceSelectionSnapshot, WorkerHealth } from "./types";
-import type { AnalysisRun, AnalysisRunStatus, DraftOperation, SemanticAnalysisDraft, SemanticConfirmResponse } from "./types";
+import type { AnalysisHistoryItem, AnalysisRun, AnalysisRunStatus, DraftOperation, SemanticAnalysisDraft, SemanticConfirmResponse } from "./types";
 
 const jsonHeaders = { "Content-Type": "application/json" };
 
@@ -555,6 +555,14 @@ export async function fetchAnalysisReviewSession(
 
 export async function fetchAnalysisRun(runId: string): Promise<AnalysisRun> {
   return request(`/api/analysis-runs/${encodeURIComponent(runId)}`);
+}
+
+export async function fetchAnalysisHistory(): Promise<{ runs: AnalysisHistoryItem[] }> {
+  return request("/api/analysis-runs");
+}
+
+export async function deleteAnalysisRun(runId: string): Promise<{ deleted_run_id: string; deleted_draft_id: string }> {
+  return request(`/api/analysis-runs/${encodeURIComponent(runId)}`, { method: "DELETE" });
 }
 
 export async function fetchAnalysisDraft(draftId: string): Promise<SemanticAnalysisDraft> {
