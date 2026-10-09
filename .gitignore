@@ -4,6 +4,7 @@ repo/
 docs/brainstorming/
 docs/superpowers/
 .venv/
+.venv*/
 venv/
 __pycache__/
 .pytest_cache/

@@ -4,6 +4,40 @@
 
 ComfyUI 在 TTS More 体系中被定位为统一的 TTS 运行载体。通过集成 TTS-Audio-Suite 插件，ComfyUI 能够整合 GPT-SoVITS、IndexTTS-2 和 CosyVoice 等多种引擎。这种架构使用 ComfyUI 内置的任务队列执行工作流；TTS More 在单 GPU `resource_group` 上保持 `capacity=1`，避免多个重模型并发争用显存。
 
+## 已有原生项目的本机接入 / Existing native projects
+
+可同时注册多套 GPT-SoVITS 和 IndexTTS 项目。原生代码、权重和训练 logs 保留在原处；ComfyUI 插件通过每套项目自己的 Python 环境读取这些资源。原生 WebUI 可以使用其他端口共存，但 `capacity=1` 只串行化 TTS More 的本机任务，不会限制独立运行的原生应用。重模型推理前应确保剩余显存充足。
+
+复制 `deployment/tts-repos/local-sources.example.json` 到被 Git 忽略的 `data/local/comfyui/source-config.json`，填写本机路径。所有 Python 辅助脚本的相对路径均以 TTS More 仓库根目录为基准。GPT 项目条目需要 `id`、`source_root`、`python_executable`；IndexTTS 条目另外需要 `reference_audio`，可选 `model_dir`、`display_name`、`lan_service_id`。`id` 在此配置中应唯一。示例条目如下，路径仅为占位示例：
+
+```json
+{
+  "id": "gpt-primary",
+  "source_root": "../GPT-SoVITS",
+  "python_executable": "../GPT-SoVITS/runtime/python.exe",
+  "logs_mapping": {"trained-voice": "../GPT-SoVITS/logs/trained-voice-session"}
+}
+```
+
+`logs_mapping` 可明确关联名称不同的训练 logs，脚本不会猜测声线身份。扫描器只读取 `2-name2text.txt` 与对应 `5-wav32k` 音频；缺少参考音频的模型会列入待映射清单。`lan_indextts` 条目需要 `service_id`、`base_url`，可选 `display_name`。局域网端点使用独立资源组；上传参考音频前应确认允许传输。
+
+准备好后端 Python 3.11 环境和前端构建，在仓库根目录运行：
+
+```powershell
+python scripts/inventory-local-tts.py
+# 安装插件，确保各项目依赖可用，再启动本机后端和 ComfyUI。
+.\Start-Local.cmd
+python scripts/configure-local-comfyui.py
+python scripts/import-comfyui-voices.py
+python scripts/export-comfyui-workflows.py
+```
+
+这些 Python 命令应使用安装了后端依赖的解释器；可通过 `--config` 指定另一份配置。启动器使用后端 `.venv311`（其次 `.venv`），ComfyUI 默认使用其 `.venv`；也可在 `backend.python_executable`、`comfyui.python_executable` 中指定解释器。ComfyUI 启动器的相对解释器路径以 ComfyUI 目录为基准。`Start-Local.cmd -ConfigPath ...` 可指定配置，服务默认只监听回环地址，运行日志位于 `data/local/run`。
+
+API 格式工作流导出到 `data/local/comfyui/workflows` 和 ComfyUI 的 `user/default/workflows/TTSMore`；`comfyui.workflow_directory` 可覆盖后一位置。这些文件是 API prompt，可通过 ComfyUI 的 `/prompt` 提交。参考音频保存在插件的持久音频资产中，需要保留对应 ComfyUI input 目录。工作台 GPT-SoVITS 面板可选择实验名、GPT 权重、SoVITS 权重、参考音频及标注；权重选择限制在注册资源的对应权重目录内，清空选择则使用资源默认权重。
+
+Multiple native checkouts can remain installed and serve their own WebUIs on distinct ports. The local ComfyUI queue serializes TTS More jobs; independent native applications still share GPU memory. Keep machine paths and assets in the ignored operator configuration. The commands above inventory model pairs, register endpoints, import annotated voices and export runnable API prompts without changing upstream source. Explicit `logs_mapping` entries resolve renamed training sessions; incomplete references remain visible as pending mappings. Use a separate resource group for each remote device and permit reference-audio transfers before sending local recordings. The workstation exposes independent GPT/SoVITS checkpoint choices, reference audio and annotation text.
+
 ## 架构
 
 ```mermaid
