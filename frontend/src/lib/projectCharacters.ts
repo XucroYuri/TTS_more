@@ -1,4 +1,5 @@
 import type { Character, EngineName, ProjectCharacter, ProviderType, ScriptProject, VoiceBinding, VoiceProfile } from "../types";
+import { engineProvider } from "./ttsProvider";
 
 export interface ProjectCharacterRow {
   id: string;
@@ -108,7 +109,7 @@ function applyProjectBinding(projectCharacter: ProjectCharacter, character: Char
   const profile: VoiceProfile = {
     id: profileId,
     name: `${projectCharacter.name} Project GPT-SoVITS`,
-    engine: engineForProvider(binding.provider_type),
+    engine: engineForProvider(engineProvider(binding.provider_type, binding.config.engine)),
     service_id: binding.service_id,
     fallback_services: binding.fallback_services ?? [],
     bindings: [cloneBinding(binding)],

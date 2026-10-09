@@ -2,6 +2,11 @@ import type { Character, EngineName, GenerationTask, ScriptLine, VoiceBinding, V
 
 export function lineEngine(line: ScriptLine, characters: Character[]): EngineName {
   const binding = lineBinding(line, characters);
+  if (binding?.provider_type === "comfyui") {
+    const engine = binding.config.engine;
+    if (engine === "gpt-sovits" || engine === "indextts" || engine === "cosyvoice") return engine;
+    return line.engine_override ?? findProfile(line, characters)?.engine ?? "cosyvoice";
+  }
   if (binding) return engineForProvider(binding.provider_type);
   const character = findCharacter(line, characters);
   const profile = findProfile(line, characters);

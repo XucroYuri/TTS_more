@@ -26,6 +26,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import {
+  CharacterLibraryConflictError,
   fetchCharacters,
   fetchProjectCharacters,
   fetchManifest,
@@ -88,6 +89,8 @@ import { formatScriptNote } from "./lib/lineNote";
 import { firstReferenceSampleFromModel, gptSovitsProjectBindingFromModel } from "./lib/modelCatalog";
 import { ensureProjectCharacters, freezeProjectCharacterLocally, projectCharacterRows, resolveProjectCharacters } from "./lib/projectCharacters";
 import { bindingCompleteness, catalogServiceOptions, roleLibraryBindingRows, roleLibraryDetailSelection, roleLibraryReferencePreview, roleLibraryServiceOptions, selectedCatalogServiceId } from "./lib/roleLibraryView";
+import { configForService, engineProvider, serviceEngineProvider } from "./lib/ttsProvider";
+import { checkpointOptions } from "./lib/checkpoints";
 import { buildGenerationTask, lineBinding, lineEngine, lineProfile, lineServiceId } from "./lib/routing";
 import { createDefaultParserProviderDraft, KWJM_API_KEY_ENV, KWJM_BASE_URL, KWJM_BASE_URL_PLACEHOLDER, KWJM_MODEL, KWJM_PROVIDER_NAME, normalizeParserProviderDrafts, parserProviderKeyState, toParserProviderSavePayload, upsertKwjmParserProvider } from "./lib/parserConfig";
 import { createEmptyManifest, createEmptyProject, createProjectId, readStoredProjectId, selectStartupProjectId, writeStoredProjectId } from "./lib/projectStartup";
@@ -512,11 +515,12 @@ export default function App() {
   const activeBindings = useMemo(() => (activeLine ? bindingsForLine(activeLine, resolvedCharacters) : []), [activeLine, resolvedCharacters]);
   const activeBinding = useMemo(() => (activeLine ? lineBinding(activeLine, resolvedCharacters) : undefined), [activeLine, resolvedCharacters]);
   const activeProfiles = useMemo(() => (activeLine ? profilesForLine(activeLine, resolvedCharacters) : []), [activeLine, resolvedCharacters]);
-  const activeProvider: ProviderType = activeLine ? activeVersionDraft?.provider_type ?? activeBinding?.provider_type ?? providerFromEngine(activeLine.engine_override) ?? "indextts" : "gpt-sovits";
+  const activeTransportProvider: ProviderType = activeLine ? activeVersionDraft?.provider_type ?? activeBinding?.provider_type ?? providerFromEngine(activeLine.engine_override) ?? "indextts" : "gpt-sovits";
+  const activeServiceId = activeLine ? activeVersionDraft?.service_id ?? lineServiceId(activeLine, resolvedCharacters) ?? "" : "";
+  const activeProvider = engineProvider(activeTransportProvider, services.find((service) => service.service_id === activeServiceId)?.engine ?? activeBinding?.config.engine ?? (activeLine ? lineEngine(activeLine, resolvedCharacters) : undefined));
   const generationMethods = useMemo(() => generationMethodOptions(), []);
   const activeGenerationMethod = generationMethodForProvider(activeProvider);
   const activeGenerationRouteLabels = useMemo(() => generationMethodRouteLabels(activeGenerationMethod), [activeGenerationMethod]);
-  const activeServiceId = activeLine ? activeVersionDraft?.service_id ?? lineServiceId(activeLine, resolvedCharacters) ?? "" : "";
   const activeServiceLoadState = activeServiceId ? serviceLoadStates[activeServiceId] : undefined;
   const activePreflightItem = activeLine ? preflightByLine.get(activeLine.line_uid ?? activeLine.id) : undefined;
   const activeExpectedLoadSignature = activePreflightItem?.load_signature ?? selectedHistoryVersion?.verified_load_signature ?? selectedHistoryVersion?.requested_load_signature ?? null;
@@ -557,7 +561,7 @@ export default function App() {
   const activeLogsReferencePayload = activeLogsReferenceRequest ? logsReferenceAudio[activeLogsReferenceRequest.key] : undefined;
   const activeLogsReferenceSamples = activeLogsReferencePayload?.samples ?? [];
   const activeLogsReferenceSample = selectedLogsReferenceSample(activeLogsReferenceSamples, activeBindingConfig, { serviceId: activeServiceId });
-  const activeReferenceAudioPath = activeProvider === "gpt-sovits" ? activeLogsReferenceSample?.path ?? stringConfig(activeBindingConfig.ref_audio_path) : "";
+  const activeReferenceAudioPath = activeProvider === "gpt-sovits" ? activeLogsReferenceSample?.path ?? referencePathForProvider(activeProvider, activeBindingConfig) : "";
   const activeReferenceAudioLabel = activeLogsReferenceSample?.display_label || shortPath(activeReferenceAudioPath) || t("inspector.referenceAudio");
   const staleLogsReferenceServiceId = stringConfig(activeBindingConfig.logs_reference_service_id);
   const isLogsReferenceFromOtherService = Boolean(activeProvider === "gpt-sovits" && staleLogsReferenceServiceId && activeServiceId && staleLogsReferenceServiceId !== activeServiceId);
@@ -1230,7 +1234,7 @@ export default function App() {
       await refreshProjects();
     } catch (error) {
       setSaveState("error");
-      setNotice(error instanceof Error ? error.message : t("notice.autoSaveFailed"));
+      setNotice(error instanceof CharacterLibraryConflictError ? t('notice.characterLibraryConflict') : error instanceof Error ? error.message : t("notice.autoSaveFailed"));
     }
   }
 
@@ -1609,6 +1613,7 @@ export default function App() {
 
   function selectGenerationProvider(provider: ProviderType) {
     if (!activeLine) return;
+    if (provider === activeProvider) return;
     if (activeVersionDraft) {
       updateActiveVersionDraft({
         provider_type: provider,
@@ -3267,9 +3272,11 @@ export default function App() {
                               <select value={activeSelectedServiceUnavailable ? "" : (activeVersionDraft?.service_id ?? lineServiceId(activeLine, resolvedCharacters) ?? "")} onChange={(event) => {
                                 const nextServiceId = event.target.value || null;
                                 if (activeVersionDraft) {
+                                  const nextService = services.find((service) => service.service_id === nextServiceId);
                                   updateActiveVersionDraft({
                                     service_id: nextServiceId,
-                                    parameters: clearServiceScopedBindingConfig(activeProvider, activeVersionDraft.parameters)
+                                    provider_type: nextService?.provider_type ?? activeVersionDraft.provider_type,
+                                    parameters: configForService(clearServiceScopedBindingConfig(activeProvider, activeVersionDraft.parameters), nextService)
                                   });
                                 } else {
                                   updateLineService(activeLine.id, nextServiceId);
@@ -3333,7 +3340,10 @@ export default function App() {
                           <div className="gpt-resource-summary-grid">
                             <div>
                               <span>{t("characters.logsName")}</span>
-                              <strong>{stringConfig(activeBindingConfig.logs_name) || t("status.unset")}</strong>
+                              <input value={stringConfig(activeBindingConfig.logs_name)} list="inspector-gpt-experiments" aria-label={t("characters.logsName")} onChange={(event) => selectActiveExperiment(event.target.value)} />
+                              <datalist id="inspector-gpt-experiments">
+                                {gptModelCatalog.filter((model) => !activeServiceId || model.service_id === activeServiceId).map((model) => <option key={model.id} value={model.logs_name ?? model.name} />)}
+                              </datalist>
                             </div>
                             <div>
                               <span>{t("inspector.service")}</span>
@@ -3364,14 +3374,14 @@ export default function App() {
                                     <span>{t("inspector.gptWeights")}</span>
                                     <select value={stringConfig(activeBindingConfig.gpt_weights_path)} onChange={(event) => updateActiveBindingConfig({ gpt_weights_path: event.target.value || undefined })}>
                                       <option value="">{t("inspector.autoDefault")}</option>
-                                      {voiceCandidates?.gpt_sovits.gpt_weights.map((item) => <option value={item.path} key={item.path}>{item.name}</option>)}
+                                      {checkpointOptions(activeBindingConfig, "gpt", voiceCandidates?.gpt_sovits.gpt_weights ?? []).map((item) => <option value={item.path} key={item.path}>{item.name}</option>)}
                                     </select>
                                   </label>
                                   <label className="resource-field">
                                     <span>{t("inspector.sovitsWeights")}</span>
                                     <select value={stringConfig(activeBindingConfig.sovits_weights_path)} onChange={(event) => updateActiveBindingConfig({ sovits_weights_path: event.target.value || undefined })}>
                                       <option value="">{t("inspector.autoDefault")}</option>
-                                      {voiceCandidates?.gpt_sovits.sovits_weights.map((item) => <option value={item.path} key={item.path}>{item.name}</option>)}
+                                      {checkpointOptions(activeBindingConfig, "sovits", voiceCandidates?.gpt_sovits.sovits_weights ?? []).map((item) => <option value={item.path} key={item.path}>{item.name}</option>)}
                                     </select>
                                   </label>
                                 </div>
@@ -3441,7 +3451,7 @@ export default function App() {
                                 <div className="manual-reference-audio-field">
                                   <ReferenceAudioInput
                                     label={t("inspector.referenceAudio")}
-                                    value={stringConfig(activeBindingConfig.ref_audio_path)}
+                                    value={referencePathForProvider(activeProvider, activeBindingConfig)}
                                     onUpload={(file) => uploadLineReference(file, "ref_audio_path")}
                                   />
                                 </div>
@@ -3698,7 +3708,7 @@ export default function App() {
       updateActiveVersionDraft({ parameters: { ...activeVersionDraft.parameters, ...patch } });
       return;
     }
-    upsertTemporaryBinding(activeLine.id, activeProvider, {
+    upsertTemporaryBinding(activeLine.id, activeTransportProvider, {
       configPatch: patch,
       serviceId: activeServiceId || activeBinding?.service_id || null,
       baseConfig: activeBindingConfig,
@@ -3718,10 +3728,12 @@ export default function App() {
     const line = project.lines.find((item) => item.id === lineId);
     if (!line) return;
     const binding = lineBinding(line, resolvedCharacters);
-    const provider = (line.temporary_binding?.provider_type ?? binding?.provider_type ?? providerFromEngine(line.engine_override) ?? "indextts") as ProviderType;
+    const service = services.find((item) => item.service_id === serviceId);
+    const provider = service?.provider_type ?? (line.temporary_binding?.provider_type ?? binding?.provider_type ?? providerFromEngine(line.engine_override) ?? "indextts") as ProviderType;
     upsertTemporaryBinding(lineId, provider, {
       serviceId,
-      baseConfig: clearServiceScopedBindingConfig(provider, line.temporary_binding?.config ?? binding?.config ?? defaultTemporaryConfig(provider, line)),
+      baseConfig: clearServiceScopedBindingConfig(engineProvider(provider, service?.engine), line.temporary_binding?.config ?? binding?.config ?? defaultTemporaryConfig(provider, line)),
+      configPatch: service?.provider_type === "comfyui" ? { engine: service.engine } : undefined,
       sourceBindingId: binding?.binding_id,
     });
   }
@@ -3737,6 +3749,9 @@ export default function App() {
         if (line.id !== lineId) return line;
         const existing = options.replaceProvider ? null : line.temporary_binding;
         const serviceId = options.serviceId !== undefined ? options.serviceId : existing?.service_id ?? defaultServiceForProvider(visibleServices, provider);
+        const service = visibleServices.find((item) => item.service_id === serviceId);
+        const bindingProvider = service?.provider_type ?? provider;
+        const parameterProvider = service ? serviceEngineProvider(service) : provider;
         const baseConfig = options.baseConfig ?? (existing?.provider_type === provider ? existing.config : defaultTemporaryConfig(provider, line));
         return {
           ...line,
@@ -3745,12 +3760,12 @@ export default function App() {
           binding_override: null,
           service_override: null,
           temporary_binding: {
-            binding_id: existing?.binding_id && existing.provider_type === provider ? existing.binding_id : options.sourceBindingId ?? `line-temp-${provider}`,
-            provider_type: provider,
+            binding_id: existing?.binding_id && existing.provider_type === bindingProvider ? existing.binding_id : options.sourceBindingId ?? `line-temp-${provider}`,
+            provider_type: bindingProvider,
             service_id: serviceId,
-            fallback_services: existing?.provider_type === provider ? existing.fallback_services ?? [] : [],
-            capabilities: defaultCapabilitiesForProvider(provider),
-            config: compactConfig({ ...baseConfig, ...(options.configPatch ?? {}) })
+            fallback_services: existing?.provider_type === bindingProvider ? existing.fallback_services ?? [] : [],
+            capabilities: defaultCapabilitiesForProvider(parameterProvider),
+            config: compactConfig({ ...configForService(baseConfig, service), ...(options.configPatch ?? {}) })
           }
         };
       })
@@ -3851,7 +3866,7 @@ export default function App() {
 
   function bindActiveModelToProjectRole() {
     if (!activeProjectCharacter || !activeModelCatalogItem) return;
-    const binding = gptSovitsProjectBindingFromModel(activeProjectCharacter.project_character_id, activeModelCatalogItem, activeModelSelectedSample);
+    const binding = gptSovitsProjectBindingFromModel(activeProjectCharacter.project_character_id, activeModelCatalogItem, activeModelSelectedSample, serviceById.get(activeModelCatalogItem.service_id ?? ""));
     setProject((current) => {
       const nextProjectCharacters = ensureProjectCharacters(current, characters).map((item) =>
         item.project_character_id === activeProjectCharacter.project_character_id
@@ -3902,7 +3917,7 @@ export default function App() {
   function writeActiveModelToLibrary() {
     if (!activeProjectCharacter || !activeModelCatalogItem) return;
     const libraryId = activeProjectCharacter.library_character_id ?? stableLibraryCharacterId(activeProjectCharacter.name, activeProjectCharacter.project_character_id);
-    const binding = gptSovitsProjectBindingFromModel(libraryId, activeModelCatalogItem, activeModelSelectedSample);
+    const binding = gptSovitsProjectBindingFromModel(libraryId, activeModelCatalogItem, activeModelSelectedSample, serviceById.get(activeModelCatalogItem.service_id ?? ""));
     const profileId = `${libraryId}-gpt-sovits`;
     const bindingId = `${libraryId}-gpt-sovits-binding`;
     const libraryBinding: VoiceBinding = {
@@ -4162,6 +4177,12 @@ export default function App() {
     setNotice(t("notice.logsReferenceApplied"));
   }
 
+  function selectActiveExperiment(logsName: string) {
+    const model = gptModelCatalog.find((item) => item.service_id === activeServiceId && (item.logs_name ?? item.name) === logsName);
+    const config = model ? gptSovitsProjectBindingFromModel(activeLine?.character_id ?? "line", model).config : { logs_name: logsName };
+    updateActiveBindingConfig(config);
+  }
+
   async function uploadLineReference(file: File | undefined, target: "voice" | "emotion_audio" | "ref_audio_path" | "prompt_audio_path") {
     if (!file || !activeLine) return;
     if (!currentProjectId) {
@@ -4378,9 +4399,9 @@ function parseVectorConfig(value: string): number[] {
 }
 
 function referencePathForProvider(provider: string, config: Record<string, unknown>): string {
-  if (provider === "indextts") return stringConfig(config.voice);
+  if (provider === "indextts") return stringConfig(config.voice) || stringConfig(config.ref_audio_path) || stringConfig(config.reference_audio);
   if (provider === "cosyvoice") return stringConfig(config.prompt_audio_path) || stringConfig(config.reference_audio);
-  return stringConfig(config.ref_audio_path);
+  return stringConfig(config.ref_audio_path) || stringConfig(config.reference_audio);
 }
 
 function logsReferenceRequest(provider: ProviderType, serviceId: string | null | undefined, config: Record<string, unknown>) {

@@ -1,19 +1,21 @@
-import type { LogsReferenceAudioSample, ReferenceAudioSample, RoleLibraryCandidate, VoiceBinding } from "../types";
+import type { LogsReferenceAudioSample, ReferenceAudioSample, RoleLibraryCandidate, VoiceBinding, WorkerHealth } from "../types";
 
 export function gptSovitsProjectBindingFromModel(
   projectCharacterId: string,
   model: RoleLibraryCandidate,
-  sample?: LogsReferenceAudioSample | ReferenceAudioSample | null
+  sample?: LogsReferenceAudioSample | ReferenceAudioSample | null,
+  service?: WorkerHealth
 ): VoiceBinding {
   const selectedSample = sample ?? firstReferenceSampleFromModel(model);
   const logsName = model.logs_name || model.name || model.id;
   return {
     binding_id: `${projectCharacterId}-project-gpt`,
-    provider_type: "gpt-sovits",
+    provider_type: service?.provider_type === "comfyui" ? "comfyui" : "gpt-sovits",
     service_id: model.service_id ?? null,
     fallback_services: [],
     capabilities: ["trained_weights_voice", "reference_audio_voice"],
     config: compactConfig({
+      engine: "gpt-sovits",
       logs_id: model.logs_id,
       logs_name: logsName,
       path_service_id: model.service_id ?? undefined,

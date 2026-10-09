@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import ntpath
 import os
 import re
@@ -25,6 +26,10 @@ from app.path_safety import (
 
 T = TypeVar("T", bound=BaseModel)
 R = TypeVar("R")
+
+
+class CharacterLibraryConflictError(ValueError):
+    pass
 
 WINDOWS_LEGACY_DIRECTORY_PATH_UNITS = 248
 WINDOWS_LEGACY_FILE_PATH_UNITS = 260
@@ -133,6 +138,7 @@ class ProjectStore:
 
     def __init__(self, root: Path) -> None:
         self.root = root
+        self._characters_lock = threading.RLock()
 
     def project_dir(self, project_id: str) -> Path:
         safe_id = self._safe_project_id(project_id)
@@ -336,15 +342,30 @@ class ProjectStore:
             return self._read_model(legacy_path, GenerationManifest)
         return GenerationManifest(project_id=project_id)
 
-    def save_characters(self, characters: list[Character]) -> None:
-        self._write_json(self.writable_characters_path(), [c.model_dump(mode="json") for c in characters])
+    def characters_revision(self) -> str:
+        with self._characters_lock:
+            path = windows_filesystem_path(self.characters_path())
+            content = path.read_bytes() if _filesystem_exists(path) else b'[]'
+            return '"'+hashlib.sha256(content).hexdigest()+'"'
+
+    def load_characters_with_revision(self) -> tuple[list[Character], str]:
+        with self._characters_lock:
+            return self.load_characters(), self.characters_revision()
+
+    def save_characters(self, characters: list[Character], expected_revision: str | None = None) -> str:
+        with self._characters_lock:
+            if expected_revision is not None and expected_revision != self.characters_revision():
+                raise CharacterLibraryConflictError('The character library changed in another window or tool. Reload it before saving your edits.')
+            self._write_json(self.writable_characters_path(), [c.model_dump(mode="json") for c in characters])
+            return self.characters_revision()
 
     def load_characters(self) -> list[Character]:
-        path = self.characters_path()
-        if not _filesystem_exists(path):
-            return []
-        data = self._read_structured(path)
-        return [Character.model_validate(item) for item in data]
+        with self._characters_lock:
+            path = self.characters_path()
+            if not _filesystem_exists(path):
+                return []
+            data = self._read_structured(path)
+            return [Character.model_validate(item) for item in data]
 
     def _write_model(self, path: Path, model: BaseModel) -> None:
         self._write_json(path, model.model_dump(mode="json"))

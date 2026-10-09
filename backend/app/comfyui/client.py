@@ -380,7 +380,10 @@ class ComfyUIAPIClient:
         while time.monotonic() < deadline:
             if cancel_check is not None and cancel_check():
                 raise_cancelled()
-            history = self.get_history(prompt_id)
+            try:
+                history = self.get_history(prompt_id)
+            except (httpx.TimeoutException, httpx.ConnectError):
+                history = {}
             entry = history.get(prompt_id)
             if entry is not None:
                 status = entry.get("status") or {}
