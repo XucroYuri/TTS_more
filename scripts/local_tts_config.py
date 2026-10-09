@@ -26,3 +26,18 @@ def source_path(value):
     """Interpret all operator paths relative to the workstation repository."""
     path = Path(value).expanduser()
     return (path if path.is_absolute() else ROOT / path).resolve()
+
+
+def gpt_reference_sample(samples):
+    """Choose an annotated recording within GPT-SoVITS' reference duration."""
+    import soundfile
+    for sample in samples:
+        if not str(sample.get('text', '')).strip():
+            continue
+        try:
+            duration = soundfile.info(sample['path']).duration
+        except (OSError, RuntimeError, KeyError):
+            continue
+        if 3 <= duration <= 10:
+            return sample
+    return None
