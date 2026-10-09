@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "backend_url": "http://127.0.0.1:8000",
+  "comfyui": {"source_root": "repo/ComfyUI", "base_url": "http://127.0.0.1:8188"},
+  "gpt_sovits_projects": [],
+  "indextts_projects": [],
+  "lan_indextts": []
+}

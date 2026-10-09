@@ -1,7 +1,10 @@
 $ErrorActionPreference = "Stop"
 
 $Root = Split-Path -Parent $PSScriptRoot
-$BackendPython = Join-Path $Root ".venv\Scripts\python.exe"
+$BackendPython = Join-Path $Root ".venv311\Scripts\python.exe"
+if (!(Test-Path -LiteralPath $BackendPython)) {
+  $BackendPython = Join-Path $Root ".venv\Scripts\python.exe"
+}
 $BackendPort = if ($env:TTS_MORE_BACKEND_PORT) { [int]$env:TTS_MORE_BACKEND_PORT } else { 8000 }
 $FrontendPort = if ($env:TTS_MORE_FRONTEND_PORT) { [int]$env:TTS_MORE_FRONTEND_PORT } else { 5173 }
 $FrontendApiTarget = if ($env:TTS_MORE_API_TARGET) { $env:TTS_MORE_API_TARGET } else { "http://127.0.0.1:$BackendPort" }
@@ -22,7 +25,7 @@ Assert-PortAvailable $BackendPort "Backend"
 Assert-PortAvailable $FrontendPort "Frontend"
 
 $Backend = Start-Process -FilePath $BackendPython `
-  -ArgumentList "-m", "uvicorn", "app.main:app", "--app-dir", "backend", "--host", "127.0.0.1", "--port", ([string]$BackendPort), "--reload" `
+  -ArgumentList "-m", "uvicorn", "app.main:app", "--app-dir", "backend", "--host", "127.0.0.1", "--port", ([string]$BackendPort), "--reload", "--reload-dir", "backend/app" `
   -WorkingDirectory $Root `
   -WindowStyle Hidden `
   -PassThru
