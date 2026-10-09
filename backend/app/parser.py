@@ -89,6 +89,7 @@ _LINE_RE = re.compile(r"^\s*(?P<speaker>[^:：\n（(]+?)\s*(?:[（(](?P<note>[^�
 _LEADING_NOTE_RE = re.compile(r"^\s*[（(](?P<note>[^）)]*)[）)]\s*(?P<text>.+?)\s*$")
 _MARKDOWN_SPEAKER_RE = re.compile(r"^\s*(?:>\s*)?(?:#{1,6}\s*)?(?:\*\*)?(?P<speaker>[^:*：`#\n][^*：:`\n]{0,80}?)(?:\*\*)?\s*$")
 _NOTE_ONLY_RE = re.compile(r"^\s*[（(](?P<note>[^）)]{1,120})[）)]\s*$")
+_INLINE_TECHNICAL_CUE_RE = re.compile(r"[（(](?:镜头[^）)]*|[^）)]{1,30}镜头|(?:camera|SFX)\s*:[^）)]*)[）)]", re.IGNORECASE)
 _KNOWN_CHINESE_SLUGS = {
     "小美": "xiao-mei",
     "王强": "wang-qiang",
@@ -101,6 +102,7 @@ _NON_DIALOGUE_ROLE_RE = re.compile(
     r"FADE\s+(?:IN|OUT)|CUT\s+TO|"
     r"INT\.?|EXT\.?|INT/EXT\.?|"
     r"ACTION|TRANSITION|TITLE|CARD"
+    r"|外景|内景|场景|转场|镜头|连续性锁定|正文[-—](?:开始|结束)"
     r")(?:\b|[:：.-]|$)",
     re.IGNORECASE,
 )
@@ -210,11 +212,11 @@ def _clean_dialogue(value: Any) -> str:
     leading_note = _LEADING_NOTE_RE.match(text)
     if leading_note:
         text = leading_note.group("text")
-    return _clean_markup(text)
+    return _clean_markup(_INLINE_TECHNICAL_CUE_RE.sub('', text))
 
 
 def _is_non_dialogue_role(value: str) -> bool:
-    role = _clean_markup(value).strip()
+    role = _clean_markup(value).strip().lstrip("【[\\")
     role = re.sub(r"\s*[:：].*$", "", role).strip()
     return bool(_NON_DIALOGUE_ROLE_RE.match(role))
 
@@ -223,6 +225,8 @@ def _is_non_tts_cue(raw: str) -> bool:
     text = _clean_markup(raw)
     if not text:
         return False
+    if re.fullmatch(r"[-*_]{3,}", text):
+        return True
     if raw.lstrip().startswith("```") or raw.lstrip().startswith("`"):
         return True
     if _is_non_dialogue_role(text):
@@ -271,7 +275,7 @@ def _strip_wrapping_dialogue_quotes(value: str) -> str:
 
 
 def _source_fidelity_text(value: Any) -> str:
-    text = _clean_markup(value)
+    text = _clean_markup(_INLINE_TECHNICAL_CUE_RE.sub('', str(value or '')))
     leading_note = _LEADING_NOTE_RE.match(text)
     if leading_note:
         text = leading_note.group("text")
@@ -280,7 +284,7 @@ def _source_fidelity_text(value: Any) -> str:
 
 
 def _source_fidelity_source(value: str) -> str:
-    text = _clean_markup(value)
+    text = _clean_markup(_INLINE_TECHNICAL_CUE_RE.sub('', value))
     return re.sub(r"\s+", " ", text).strip()
 
 
@@ -332,7 +336,11 @@ def _source_excerpt_markdown_speaker(source_excerpt: str, source_text: str) -> s
             continue
         dialogue: list[str] = []
         line_index = index + 1
+        while line_index < len(raw_lines) and not raw_lines[line_index].strip():
+            line_index += 1
         if line_index < len(raw_lines) and _NOTE_ONLY_RE.match(raw_lines[line_index].strip()):
+            line_index += 1
+        while line_index < len(raw_lines) and not raw_lines[line_index].strip():
             line_index += 1
         while line_index < len(raw_lines):
             candidate = raw_lines[line_index]
@@ -364,6 +372,12 @@ def _quoted_dialogue_candidates(source_text: str) -> list[str]:
     return ordered
 
 
+def _script_body(text: str) -> str:
+    """Exclude a clearly labelled outline from screenplay coverage checks."""
+    heading = re.search(r"(?im)^\s*#{1,6}\s*(?:剧本正文|正文|script body|screenplay body)\s*$", text)
+    return text[heading.end():] if heading else text
+
+
 def _source_excerpt_speaker(source_excerpt: str, source_text: str) -> str | None:
     excerpt = _source_fidelity_source(source_excerpt)
     needle = _source_fidelity_text(source_text)
@@ -390,8 +404,10 @@ def _source_excerpt_speaker(source_excerpt: str, source_text: str) -> str | None
 
 
 def _speaker_matches_character(expected_speaker: str, character_id: str, character_name: str) -> bool:
-    expected = _clean_markup(expected_speaker)
-    actual_name = _clean_markup(character_name or character_id)
+    def without_performance_note(value: str) -> str:
+        return re.sub(r"\s*(?:[-—]{2,}\s*)?[（(][^）)]{1,120}[）)]\s*$", '', _clean_markup(value)).strip()
+    expected = without_performance_note(expected_speaker)
+    actual_name = without_performance_note(character_name or character_id)
     if not expected:
         return True
     if expected.casefold() == actual_name.casefold() or expected.casefold() == character_id.casefold():
@@ -402,14 +418,17 @@ def _speaker_matches_character(expected_speaker: str, character_id: str, charact
 
 def _ordered_coverage_count(expected: list[str], actual: list[str]) -> int:
     actual_index = 0
+    offset = 0
     matched = 0
     for candidate in expected:
-        while actual_index < len(actual) and actual[actual_index] != candidate:
+        while actual_index < len(actual):
+            position = actual[actual_index].find(candidate, offset)
+            if position >= 0:
+                matched += 1
+                offset = position + len(candidate)
+                break
             actual_index += 1
-        if actual_index >= len(actual):
-            continue
-        matched += 1
-        actual_index += 1
+            offset = 0
     return matched
 
 
@@ -467,7 +486,7 @@ class ScriptParseVerifier:
 
 def _reference_dialogue_texts(text: str) -> list[str]:
     dialogue_lines: list[str] = []
-    raw_lines = text.splitlines()
+    raw_lines = _script_body(text).splitlines()
     index = 0
     while index < len(raw_lines):
         raw = raw_lines[index]
@@ -496,7 +515,11 @@ def _reference_dialogue_texts(text: str) -> list[str]:
         if speaker is not None:
             dialogue: list[str] = []
             index += 1
+            while index < len(raw_lines) and not raw_lines[index].strip():
+                index += 1
             if index < len(raw_lines) and _NOTE_ONLY_RE.match(raw_lines[index].strip()):
+                index += 1
+            while index < len(raw_lines) and not raw_lines[index].strip():
                 index += 1
             while index < len(raw_lines):
                 candidate = raw_lines[index]
@@ -824,7 +847,7 @@ def _quality_reasons(draft: ParsedScriptDraft, source_text: str) -> list[str]:
     expected = _reference_dialogue_texts(source_text)
     if expected and len(draft.lines) < len(expected):
         reasons.append(f"missing dialogue lines: expected at least {len(expected)}, got {len(draft.lines)}")
-    quoted_candidates = _quoted_dialogue_candidates(source_text)
+    quoted_candidates = _quoted_dialogue_candidates(_script_body(source_text))
     quoted_line_texts = [
         _source_fidelity_text((draft.source_evidence.get(line.id) or LineSourceEvidence()).source_text or line.text)
         for line in draft.lines
