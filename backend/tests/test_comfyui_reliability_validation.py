@@ -11332,27 +11332,7 @@ def test_fix11_preflight_success_retires_failed_summary_and_legacy_case(
     failed_case_path.write_bytes(_fix8_attempt1_failed_case_path().read_bytes())
     fixture_path = tmp_path / "fixture.json"
     fixture_path.write_text(json.dumps(_fixture_document()), encoding="utf-8")
-    http_probe = _ExecutorHttpProbe()
-    host_probe = _ExecutorHostProbe()
-
-    result = reliability_validation.main(
-        [
-            "--fixture",
-            str(fixture_path),
-            "--output-root",
-            str(output_root),
-            "--comfyui-pid",
-            "8188",
-            "--tts-more-pid",
-            "8000",
-            "--preflight-only",
-        ],
-        probe_factory=lambda _fixture, _args: (
-            http_probe,
-            host_probe,
-            host_probe.owned_processes,
-        ),
-    )
+    result = _fix11_run_preflight(output_root, fixture_path)
 
     assert result == 0
     assert json.loads((output_root / "preflight.json").read_text(encoding="utf-8"))[
@@ -11388,26 +11368,30 @@ def test_fix11_preflight_success_retires_failed_summary_and_legacy_case(
 
 
 def _fix11_run_preflight(output_root: Path, fixture_path: Path) -> int:
+    """Exercise retained root-marker publication, separate from run-scoped CLI.
+
+    These tests cover archival, retirement and rollback of the historical root
+    layout. The CLI now writes immutable run-scoped evidence and intentionally
+    never retires that layout; its required run-key contract is tested below.
+    """
+    fixture = ReliabilityFixture.model_validate_json(fixture_path.read_text(encoding="utf-8"))
     http_probe = _ExecutorHttpProbe()
     host_probe = _ExecutorHostProbe()
-    return reliability_validation.main(
-        [
-            "--fixture",
-            str(fixture_path),
-            "--output-root",
-            str(output_root),
-            "--comfyui-pid",
-            "8188",
-            "--tts-more-pid",
-            "8000",
-            "--preflight-only",
-        ],
-        probe_factory=lambda _fixture, _args: (
-            http_probe,
-            host_probe,
-            host_probe.owned_processes,
-        ),
-    )
+    http = http_probe.preflight(fixture)
+    host = host_probe.preflight(fixture)
+    reliability_validation._validate_preflight(fixture, http, host, host_probe.owned_processes)
+    marker = reliability_validation._public_preflight_marker(http, host)
+    try:
+        reliability_validation._publish_public_terminal_marker(
+            output_root,
+            marker_name="preflight.json",
+            document=marker.model_dump(mode="json"),
+            stage="preflight",
+        )
+    except reliability_validation.LiveValidationError as failure:
+        reliability_validation._persist_failure_marker(output_root, failure)
+        return 1
+    return 0
 
 
 def _fix11_seed_failed_cohort(
