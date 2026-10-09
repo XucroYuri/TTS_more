@@ -43,6 +43,43 @@ def test_script_parse_verifier_accepts_llm_draft_with_traceable_dialogue() -> No
     ScriptParseVerifier().verify(source, draft)
 
 
+def test_screenplay_with_outline_blank_lines_and_embedded_quotes() -> None:
+    source = '大纲：守卫说“别走”。\n\n## 剧本正文\n\n### 外景. 水牢\n\n【连续性锁定：仍在水下。】\n\n**NARRATOR**\n\n(calm)\n\n你敢对他说“不”？\n\n---\n\n**NARRATOR**\n\n继续走。'
+    draft = make_draft(lines=[
+        ScriptLine(id='l001', character_id='narrator', text='你敢对他说“不”？'),
+        ScriptLine(id='l002', character_id='narrator', text='继续走。'),
+    ])
+    ScriptParseVerifier().verify(source, draft)
+    with pytest.raises(ParserQualityError, match='missing dialogue lines'):
+        ScriptParseVerifier().verify(source, make_draft(lines=draft.lines[:1]))
+
+
+def test_blank_lines_do_not_hide_wrong_markdown_speaker() -> None:
+    source = '**ALICE**\n\n(calm)\n\nHello.'
+    draft = make_draft(source_evidence={'l001':LineSourceEvidence(source_text='Hello.', source_excerpt=source)})
+    with pytest.raises(ParserQualityError, match='speaker ALICE'):
+        ScriptParseVerifier().verify(source, draft)
+
+
+def test_multiple_attributed_quotes_can_remain_in_one_spoken_line() -> None:
+    source = '**NARRATOR**\n我先说“走”，再说“停”。'
+    ScriptParseVerifier().verify(source, make_draft(lines=[ScriptLine(id='l001', character_id='narrator', text='我先说“走”，再说“停”。')]))
+    with pytest.raises(ParserQualityError, match='quoted dialogue coverage'):
+        ScriptParseVerifier().verify(source, make_draft(lines=[ScriptLine(id='l001', character_id='narrator', text='我先说“走”')]))
+
+
+def test_inline_camera_cue_is_excluded_without_rewriting_dialogue() -> None:
+    source = '**NARRATOR**\n已经伤成这样（镜头给受伤的手臂）。继续走（明天）。'
+    draft = make_draft(lines=[ScriptLine(id='l001',character_id='narrator',text='已经伤成这样。继续走（明天）。')], source_evidence={'l001':LineSourceEvidence(source_text='已经伤成这样（镜头给受伤的手臂）。继续走（明天）。',source_excerpt=source)})
+    ScriptParseVerifier().verify(source,draft)
+
+
+def test_performance_suffix_does_not_change_speaker_identity() -> None:
+    source = '**NARRATOR（闪回）**\n\nHello.'
+    draft = make_draft(source_evidence={'l001':LineSourceEvidence(source_text='Hello.',source_excerpt=source)})
+    ScriptParseVerifier().verify(source,draft)
+
+
 def test_script_parse_verifier_rejects_non_dialogue_roles() -> None:
     draft = make_draft(
         characters=[Character(id="sfx", name="SFX")],
