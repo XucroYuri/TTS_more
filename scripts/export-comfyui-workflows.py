@@ -1,9 +1,11 @@
 """Export runnable API prompts backed by persistent bridge reference assets."""
 import json
+import hashlib
 import sys
 from pathlib import Path
 
 import httpx
+import soundfile
 from local_tts_config import ROOT, integration_folder, load_config, source_path
 
 config, _ = load_config(__doc__)
@@ -42,9 +44,14 @@ with httpx.Client(timeout=120, trust_env=False) as client:
             params = characters[rid]['profiles'][0]['config']
             audio = Path(params['reference_audio'])
             reference_text = params['prompt_text']
+            if not reference_text.strip() or not 3 <= soundfile.info(audio).duration <= 10:
+                pending.append(rid)
+                print('Valid 3-10s annotated reference required:',rid,flush=True)
+                continue
         entry = assets.get(rid)
+        audio_hash = hashlib.sha256(audio.read_bytes()).hexdigest()
         stored = comfy_root / 'input/tts-audio-suite' / entry['filename'] if entry else None
-        if stored is None or not stored.is_file():
+        if stored is None or not stored.is_file() or entry.get('sha256') != audio_hash:
             with audio.open('rb') as handle:
                 response = client.post(comfy_url+'/api/tts-audio-suite/v1/assets/audio',files={'audio':(audio.name,handle,'application/octet-stream')})
             response.raise_for_status()

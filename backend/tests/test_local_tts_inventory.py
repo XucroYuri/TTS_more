@@ -3,6 +3,9 @@ import importlib.util
 import json
 import subprocess
 import sys
+import hashlib
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
@@ -47,3 +50,76 @@ def test_relative_operator_paths_use_repository_root(tmp_path, monkeypatch):
     monkeypatch.setattr(module, "ROOT", tmp_path / "workstation")
     assert module.source_path("../native/models") == tmp_path / "native" / "models"
     assert module.integration_folder({}) == tmp_path / "workstation" / "data/local/comfyui"
+
+
+def test_gpt_reference_defaults_skip_short_long_unannotated_and_missing_audio(tmp_path):
+    import numpy as np
+    import soundfile
+    spec = importlib.util.spec_from_file_location("local_tts_reference_for_test", ROOT / "scripts/local_tts_config.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    samples = [{'path':str(tmp_path/'missing.wav'),'text':'Missing audio'}]
+    for name,seconds,text in [('short',2,'Short'),('long',11,'Long'),('unannotated',4,''),('valid',4,'Valid annotation')]:
+        path = tmp_path/(name+'.wav')
+        soundfile.write(path,np.ones(seconds*8000)*.1,8000)
+        samples.append({'path':str(path),'text':text})
+    assert module.gpt_reference_sample(samples) == samples[-1]
+    assert module.gpt_reference_sample(samples[:-1]) is None
+
+
+def test_workflow_export_replaces_changed_cached_audio_and_reuses_current_asset(tmp_path):
+    import numpy as np
+    import soundfile
+    audio = tmp_path/'selected.wav'
+    soundfile.write(audio,np.ones(4*8000)*.1,8000)
+    digest = hashlib.sha256(audio.read_bytes()).hexdigest()
+    integration = tmp_path/'integration'
+    integration.mkdir()
+    comfy = tmp_path/'comfy'
+    asset_root = comfy/'input/tts-audio-suite'
+    asset_root.mkdir(parents=True)
+    (asset_root/'old.wav').write_bytes(b'old reference')
+    (integration/'resources.yaml').write_text(json.dumps({'resources':{'hero':{'engine':'gpt_sovits'}}}),encoding='utf-8')
+    (integration/'workflow-assets.json').write_text(json.dumps({'hero':{'asset_id':'old','filename':'old.wav','sha256':'0'*64}}),encoding='utf-8')
+    uploads = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def send_json(self, payload):
+            body = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header('Content-Type','application/json')
+            self.send_header('Content-Length',str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            assert self.path=='/api/characters'
+            self.send_json([{'id':'hero','profiles':[{'config':{'reference_audio':str(audio),'prompt_text':'Reference annotation'}}]}])
+
+        def do_POST(self):
+            assert self.path=='/api/tts-audio-suite/v1/assets/audio'
+            uploads.append(self.rfile.read(int(self.headers['Content-Length'])))
+            (asset_root/'replacement.wav').write_bytes(audio.read_bytes())
+            self.send_json({'asset_id':'replacement','filename':'replacement.wav','sha256':digest})
+
+    server = ThreadingHTTPServer(('127.0.0.1',0),Handler)
+    thread = threading.Thread(target=server.serve_forever,daemon=True)
+    thread.start()
+    url = f'http://127.0.0.1:{server.server_port}'
+    config = tmp_path/'config.json'
+    config.write_text(json.dumps({'version':1,'integration_dir':str(integration),'backend_url':url,'comfyui':{'source_root':str(comfy),'base_url':url}}),encoding='utf-8')
+    try:
+        for _ in range(2):
+            subprocess.run([sys.executable,str(ROOT/'scripts/export-comfyui-workflows.py'),'--config',str(config)],capture_output=True,text=True,check=True)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+    assert len(uploads)==1
+    workflow = json.loads((integration/'workflows/hero.api.json').read_text(encoding='utf-8'))
+    assert workflow['2']['inputs']=={'asset_id':'replacement','reference_text':'Reference annotation'}
+    assert (comfy/'user/default/workflows/TTSMore/hero.api.json').read_bytes()==(integration/'workflows/hero.api.json').read_bytes()
+    assert (asset_root/'old.wav').exists()

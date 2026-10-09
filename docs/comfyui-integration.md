@@ -19,7 +19,7 @@ ComfyUI 在 TTS More 体系中被定位为统一的 TTS 运行载体。通过集
 }
 ```
 
-`logs_mapping` 可明确关联名称不同的训练 logs，脚本不会猜测声线身份。扫描器只读取 `2-name2text.txt` 与对应 `5-wav32k` 音频；缺少参考音频的模型会列入待映射清单。`lan_indextts` 条目需要 `service_id`、`base_url`，可选 `display_name`。局域网端点使用独立资源组；上传参考音频前应确认允许传输。
+`logs_mapping` 可明确关联名称不同的训练 logs，脚本不会猜测声线身份。扫描器只读取 `2-name2text.txt` 与对应 `5-wav32k` 音频；GPT 默认参考音频会选择有标注且长为 3–10 秒的记录，缺少可用参考音频的模型会列入待映射清单。导出器按音频内容哈希更新缓存，保留旧资产供已复制的工作流继续使用。`lan_indextts` 条目需要 `service_id`、`base_url`，可选 `display_name`。局域网端点使用独立资源组；上传参考音频前应确认允许传输。
 
 准备好后端 Python 3.11 环境和前端构建，在仓库根目录运行：
 
