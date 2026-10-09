@@ -23,7 +23,16 @@ from app.comfyui.workflow_builder import (
     build_gpt_sovits_workflow,
 )
 from app.models import EngineName, ProviderType, ScriptLine, TTSServiceEndpoint
-from app.services import ComfyUITTSClient, build_service_client
+from app.services import ComfyUITTSClient, build_service_client, build_load_signature
+
+
+def test_selected_checkpoints_and_reference_change_comfyui_load_identity():
+    endpoint = TTSServiceEndpoint(service_id='comfy-gpt',provider_type='comfyui',engine='gpt-sovits',base_url='http://127.0.0.1:8188',api_contract='comfyui-tts-audio-suite-v1')
+    base = {'resource_id':'voice','reference_audio':'old.wav','ref_audio_path':'selected.wav'}
+    signature = build_load_signature(endpoint,base)
+    assert 'reference_audio=selected.wav' in signature
+    assert build_load_signature(endpoint,{**base,'gpt_weights_path':'voice-e20.ckpt'}) != signature
+    assert build_load_signature(endpoint,{**base,'sovits_weights_path':'voice_e8.pth'}) != signature
 
 
 def _cosyvoice_endpoint(base_url: str = "http://127.0.0.1:8188") -> TTSServiceEndpoint:
@@ -57,6 +66,34 @@ def _audio_bytes() -> bytes:
         output.setframerate(16000)
         output.writeframes(b"\x00\x10" * 160)
     return buffer.getvalue()
+
+
+@pytest.mark.parametrize(('engine', 'reference_key'), [('gpt-sovits', 'ref_audio_path'), ('indextts', 'voice'), ('cosyvoice', 'prompt_audio_path')])
+def test_engine_reference_selection_replaces_stale_generic_reference(tmp_path, engine, reference_key):
+    selected = tmp_path / 'selected.wav'
+    selected.write_bytes(_audio_bytes())
+    uploads = []
+
+    def handler(request):
+        if request.url.path.endswith('/assets/audio'):
+            uploads.append(request.content)
+            return httpx.Response(201, json={'asset_id':'chosen'})
+        if request.url.path == '/prompt':
+            return httpx.Response(200, json={'prompt_id':'prompt'})
+        if request.url.path == '/history/prompt':
+            return httpx.Response(200, json={'prompt':{'outputs':{'4':{'audio':[{'filename':'result.wav','subfolder':'','type':'output'}]}}}})
+        if request.url.path == '/view':
+            return httpx.Response(200, content=_audio_bytes())
+        if request.url.path.endswith('/assets/audio/chosen'):
+            return httpx.Response(200, json={'deleted':True})
+        return httpx.Response(404)
+
+    endpoint = _cosyvoice_audio_suite_endpoint().model_copy(update={'engine':EngineName(engine)})
+    client = ComfyUITTSClient(endpoint, transport=httpx.MockTransport(handler))
+    parameters = {'engine':engine, 'reference_audio':str(tmp_path/'missing-old.wav'), reference_key:str(selected), 'prompt_text':'Reference text'}
+    client.synthesize(SynthesisRequest(line=ScriptLine(id='line',character_id='role',text='Hello.'),profile='chosen',output_path=tmp_path/'out.wav',parameters=parameters))
+    assert len(uploads) == 1 and b'filename="selected.wav"' in uploads[0]
+    assert f'reference_audio={selected}' in build_load_signature(endpoint,parameters)
 
 
 def test_synthesis_request_carries_cancel_check_and_control_details(tmp_path):
@@ -419,6 +456,21 @@ class TestComfyUIAPIClient:
             api = ComfyUIAPIClient("http://127.0.0.1:8188", transport=client._transport)
             result = api.submit_workflow({"1": {"class_type": "TestNode", "inputs": {}}})
             assert result == prompt_id
+
+    @pytest.mark.parametrize('error', [httpx.ReadTimeout, httpx.ConnectError])
+    def test_poll_recovers_after_transient_history_failure(self, error):
+        calls = 0
+
+        def handler(request):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise error('temporary failure', request=request)
+            return httpx.Response(200, json={'prompt': {'outputs': {'4': {'audio': []}}}})
+
+        api = ComfyUIAPIClient('http://127.0.0.1:8188', transport=httpx.MockTransport(handler))
+        assert api.poll_until_done('prompt', poll_interval=0, max_wait=1)['outputs']
+        assert calls == 2
 
     def test_poll_until_done_completes(self):
         prompt_id = "abc123"

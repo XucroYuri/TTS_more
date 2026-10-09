@@ -70,6 +70,16 @@ def test_controlled_template_preserves_engine_specific_controls() -> None:
     assert workflow["1"]["inputs"]["temperature"] == 0.7
 
 
+def test_gpt_checkpoint_selections_reach_the_engine_node() -> None:
+    workflow = build_workflow_template('controlled', 'gpt-sovits', {
+        'resource_id':'registered-voice', 'text':'你好',
+        'gpt_weights_path':'/models/GPT_weights/voice-e20.ckpt',
+        'sovits_weights_path':'/models/SoVITS_weights/voice_e8.pth',
+    })
+    assert workflow['1']['inputs']['gpt_checkpoint'] == 'voice-e20.ckpt'
+    assert workflow['1']['inputs']['sovits_checkpoint'] == 'voice_e8.pth'
+
+
 def test_unknown_workflow_template_fails_closed() -> None:
     with pytest.raises(ValueError, match="Unsupported ComfyUI TTS workflow template"):
         build_workflow_template(

@@ -1,6 +1,15 @@
 import type { CatalogProvider, Character, DemoValidationPlan, GenerationJob, GenerationManifest, GenerationPreflightResponse, GenerationTask, GPTSoVITSModelCatalogResponse, LogsReferenceAudioResponse, OpenSourceTTSCatalogItem, OpenSourceTTSConfigureRequest, OpenSourceTTSDetectRequest, OpenSourceTTSDetectResponse, ParseRevision, ParsedDraft, ParserProviderDraft, ParserProviderTestResponse, ParserProvidersResponse, ParserProvidersSavePayload, ProjectCharactersResponse, ProjectCharacter, ProjectSummary, QueueStatus, ReferenceAudioGroup, RoleLibraryCandidate, RoleLibraryScanResponse, RuntimeMode, ScriptProject, ScriptRevision, ServiceActionResult, ServiceLoadState, ServiceLogResponse, ServiceSettingsPayload, ServiceSettingsResponse, VoiceCandidates, WorkerHealth } from "./types";
 
 const jsonHeaders = { "Content-Type": "application/json" };
+let characterLibraryRevision: string | null = null;
+let savedCharactersJson: string | null = null;
+
+export class CharacterLibraryConflictError extends Error {
+  constructor() {
+    super('Character library changed; reload before saving');
+    this.name = 'CharacterLibraryConflictError';
+  }
+}
 
 /** API token for the optional backend auth (set when the backend has
  * TTS_MORE_API_TOKEN configured). Held only in a module variable — never
@@ -38,9 +47,15 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
     const body = await response.text();
     throw new Error(body || "API token required");
   }
+  if (response.status === 412 && url === '/api/characters') {
+    throw new CharacterLibraryConflictError();
+  }
   if (!response.ok) {
     const body = await response.text();
     throw new Error(body || response.statusText);
+  }
+  if (url === "/api/characters") {
+    characterLibraryRevision = response.headers.get("ETag");
   }
   return response.json() as Promise<T>;
 }
@@ -296,15 +311,21 @@ export async function uploadCharacterAvatar(characterId: string, file: File): Pr
 }
 
 export async function saveCharacters(characters: Character[]): Promise<void> {
+  const payload = JSON.stringify(characters);
+  // Saving an unchanged project must not overwrite an externally updated library.
+  if (payload === savedCharactersJson) return;
   await request("/api/characters", {
     method: "PUT",
-    headers: jsonHeaders,
-    body: JSON.stringify(characters)
+    headers: { ...jsonHeaders, ...(characterLibraryRevision ? { "If-Match": characterLibraryRevision } : {}) },
+    body: payload
   });
+  savedCharactersJson = payload;
 }
 
 export async function fetchCharacters(): Promise<Character[]> {
-  return request("/api/characters");
+  const characters = await request<Character[]>("/api/characters");
+  savedCharactersJson = JSON.stringify(characters);
+  return characters;
 }
 
 export async function fetchCharacterLibrary(): Promise<{ characters: Character[] }> {

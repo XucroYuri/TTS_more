@@ -1,4 +1,5 @@
 import type { Character, CharacterReferenceAudioGroup, ReferenceAudioSample, VoiceBinding, WorkerHealth } from "../types";
+import { engineProvider, serviceEngineProvider } from "./ttsProvider";
 
 export type RoleLibraryServiceState = "ready" | "partial" | "blocked" | "disabled";
 
@@ -55,7 +56,7 @@ export function roleLibraryServiceOptions(services: WorkerHealth[]): RoleLibrary
     .filter((service) => service.service_kind !== "llm-parser" && Boolean(service.service_id))
     .map((service) => {
       const serviceId = service.service_id ?? "";
-      const providerType = service.provider_type ?? service.engine;
+      const providerType = serviceEngineProvider(service);
       const apiContract = service.api_contract ?? service.engine;
       return {
         service,
@@ -111,13 +112,14 @@ export function roleLibraryBindingRows(character: Character, services: WorkerHea
     (profile.bindings ?? []).map((binding) => {
       const serviceId = binding.service_id ?? profile.service_id ?? null;
       const service = serviceId ? serviceById.get(serviceId) : undefined;
-      const completeness = bindingCompleteness(binding);
+      const providerType = engineProvider(binding.provider_type, profile.engine);
+      const completeness = bindingCompleteness(binding, providerType);
       return {
         binding,
         bindingId: binding.binding_id,
         profileId: profile.id,
         profileName: profile.name,
-        providerType: binding.provider_type,
+        providerType,
         serviceId,
         serviceLabel: service?.label ?? serviceId ?? "",
         complete: completeness.complete,
@@ -127,16 +129,16 @@ export function roleLibraryBindingRows(character: Character, services: WorkerHea
   );
 }
 
-export function bindingCompleteness(binding: VoiceBinding): { complete: boolean; missing: string[] } {
+export function bindingCompleteness(binding: VoiceBinding, provider = engineProvider(binding.provider_type, binding.config.engine)): { complete: boolean; missing: string[] } {
   const config = binding.config ?? {};
   const missing: string[] = [];
-  if (binding.provider_type === "gpt-sovits") {
+  if (provider === "gpt-sovits") {
     if (!config.logs_name) missing.push("logs");
     if (!config.gpt_weights_path) missing.push("GPT");
     if (!config.sovits_weights_path) missing.push("SoVITS");
-    if (!config.ref_audio_path) missing.push("ref");
+    if (!config.ref_audio_path && !config.reference_audio) missing.push("ref");
     if (!config.prompt_text) missing.push("prompt");
-  } else if (binding.provider_type === "indextts") {
+  } else if (provider === "indextts") {
     if (!config.voice && !config.ref_audio_path && !config.reference_audio) missing.push("voice");
   } else if (!config.voice && !config.voice_id && !config.model) {
     missing.push("voice");
@@ -153,12 +155,13 @@ function roleLibraryServiceState(service: WorkerHealth): RoleLibraryServiceState
 }
 
 function supportsModelCatalog(service: WorkerHealth): boolean {
-  const provider = service.provider_type ?? service.engine;
+  const provider = serviceEngineProvider(service);
   const capabilities = service.capabilities ?? [];
   if (provider !== "gpt-sovits") return false;
   return (
     service.api_contract === "gradio-gpt-sovits-webui" ||
     service.api_contract === "gpt-sovits-api-v2" ||
+    service.api_contract === "comfyui-tts-audio-suite-v1" ||
     capabilities.includes("gpt-sovits-api-v2") ||
     capabilities.includes("model_catalog") ||
     capabilities.includes("gradio_webui")

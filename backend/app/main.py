@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Header, HTTPException, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -33,6 +33,7 @@ from app.service_config import ServiceSettingsUpdate, public_service_settings, s
 from app.services import COMFYUI_TTS_AUDIO_SUITE_CONTRACT, ServiceRegistry, ServiceRouter, build_load_signature, require_remote_artifact_transfer
 from app.comfyui.workflow_builder import workflow_template_catalog
 from app.storage import (
+    CharacterLibraryConflictError,
     ProjectStore,
     windows_display_path,
     windows_filesystem_path,
@@ -122,6 +123,7 @@ def create_app(
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        expose_headers=["ETag"],
     )
     # Optional shared bearer token. No-op (all requests pass through) when
     # TTS_MORE_API_TOKEN is unset; enforces Authorization: Bearer <token> on
@@ -505,12 +507,17 @@ def create_app(
             }
 
     @app.get("/api/characters")
-    def get_characters() -> list[dict[str, Any]]:
-        return [character.model_dump(mode="json") for character in store.load_characters()]
+    def get_characters(response: Response) -> list[dict[str, Any]]:
+        characters, revision = store.load_characters_with_revision()
+        response.headers['ETag'] = revision
+        return [character.model_dump(mode="json") for character in characters]
 
     @app.put("/api/characters")
-    def put_characters(characters: list[Character]) -> dict[str, str]:
-        store.save_characters(characters)
+    def put_characters(characters: list[Character], response: Response, if_match: str | None = Header(default=None)) -> dict[str, str]:
+        try:
+            response.headers['ETag'] = store.save_characters(characters, expected_revision=if_match)
+        except CharacterLibraryConflictError as exc:
+            raise HTTPException(status_code=412, detail=str(exc)) from exc
         return {"status": "saved"}
 
     @app.post("/api/characters/{character_id}/avatar/upload")
@@ -1871,9 +1878,17 @@ def _enrich_tasks_for_project(
         if line.temporary_binding is not None:
             binding = line.temporary_binding
             parameters = {**binding.config, **task.parameters, **revision_parameters, "binding_source": "temporary"}
+            binding_engine = PROVIDER_ENGINE_DEFAULTS[binding.provider_type]
+            if binding.provider_type.value == "comfyui":
+                try:
+                    endpoint = service_registry.get(task.service_id or line.service_override or binding.service_id)
+                except KeyError as exc:
+                    raise ValueError('ComfyUI binding needs a registered service') from exc
+                binding_engine = endpoint.engine or task.engine
+                parameters['engine'] = binding_engine.value
             enriched = task.model_copy(
                 update={
-                    "engine": PROVIDER_ENGINE_DEFAULTS[binding.provider_type],
+                    "engine": binding_engine,
                     "profile": binding.binding_id,
                     "service_id": task.service_id or line.service_override or binding.service_id,
                     "fallback_service_ids": task.fallback_service_ids or binding.fallback_services,
@@ -1905,9 +1920,17 @@ def _enrich_tasks_for_project(
         if binding is None and profile.bindings:
             binding = profile.bindings[0]
         parameters = {**profile.config, **(binding.config if binding else {}), **task.parameters, **revision_parameters}
+        effective_engine = profile.engine
+        if binding and binding.provider_type.value == 'comfyui':
+            try:
+                endpoint = service_registry.get(task.service_id or binding.service_id or profile.service_id)
+            except KeyError as exc:
+                raise ValueError('ComfyUI binding needs a registered service') from exc
+            effective_engine = endpoint.engine or profile.engine
+            parameters['engine'] = effective_engine.value
         enriched = task.model_copy(
             update={
-                "engine": profile.engine,
+                "engine": effective_engine,
                 "profile": profile.id,
                 "service_id": task.service_id or (binding.service_id if binding else None) or profile.service_id,
                 "fallback_service_ids": task.fallback_service_ids or (binding.fallback_services if binding else []) or profile.fallback_services,
@@ -1956,6 +1979,8 @@ def _validate_generation_tasks(tasks: list[GenerationTask], service_registry: Se
 
 def _assert_generation_inputs(task: GenerationTask, service_registry: ServiceRegistry) -> None:
     provider = task.provider_type.value if task.provider_type is not None else task.engine.value
+    if provider == 'comfyui':
+        provider = task.engine.value
     params = task.parameters
     if provider == "gpt-sovits":
         missing = []

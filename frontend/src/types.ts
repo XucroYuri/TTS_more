@@ -1,5 +1,5 @@
 export type EngineName = "gpt-sovits" | "indextts" | "cosyvoice" | "vibevoice" | "commercial";
-export type ProviderType = "gpt-sovits" | "indextts" | "cosyvoice" | "vibevoice" | "openai" | "gemini" | "xai" | "volcengine" | "generic-http";
+export type ProviderType = "gpt-sovits" | "indextts" | "cosyvoice" | "vibevoice" | "openai" | "gemini" | "xai" | "volcengine" | "generic-http" | "comfyui";
 export type SourceProfile = "local_repo" | "local_endpoint" | "lan_endpoint" | "cloud_endpoint" | "api_placeholder";
 export type CatalogProvider = "gpt-sovits" | "indextts" | "cosyvoice";
 export type SetupState = "not_configured" | "repo_missing" | "repo_found" | "env_missing" | "endpoint_unreachable" | "partial" | "ready";

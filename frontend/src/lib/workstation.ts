@@ -1,4 +1,5 @@
 import type { GenerationManifest, LineHistory, ParserProviderConfig, RuntimeMode, ScriptLine, VoiceCandidates, WorkerHealth } from "../types";
+import { serviceEngineProvider } from "./ttsProvider";
 
 export type LineStatusFilter = "all" | "not-generated" | "queued" | "loading" | "running" | "finalizing" | "cancelling" | "completed" | "failed" | "cancelled";
 
@@ -45,7 +46,7 @@ export interface CoreProviderCoverage {
 
 export function coreProviderCoverage(services: WorkerHealth[]): CoreProviderCoverage[] {
   return Array.from(coreLocalProviders).map((provider) => {
-    const providerServices = services.filter((service) => service.enabled !== false && (service.provider_type ?? service.engine) === provider);
+    const providerServices = services.filter((service) => service.enabled !== false && serviceEngineProvider(service) === provider);
     return {
       provider,
       services: providerServices,
@@ -78,7 +79,7 @@ export function isServiceRoutable(service: WorkerHealth): boolean {
 }
 
 export function routableProviderServices(services: WorkerHealth[], provider: string): WorkerHealth[] {
-  return services.filter((service) => service.provider_type === provider && Boolean(service.service_id) && isServiceRoutable(service));
+  return services.filter((service) => serviceEngineProvider(service) === provider && Boolean(service.service_id) && isServiceRoutable(service));
 }
 
 export function validationRunState(

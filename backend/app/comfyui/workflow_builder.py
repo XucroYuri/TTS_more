@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import PureWindowsPath
 from typing import Any
 
 
@@ -142,6 +143,10 @@ def build_gpt_sovits_workflow(params: dict[str, Any]) -> dict[str, Any]:
         "top_p": float(params.get("top_p", 1.0)),
         "temperature": float(params.get("temperature", 1.0)),
     }
+    for node_key, aliases in (("gpt_checkpoint", ("gpt_weights_path", "gpt_checkpoint", "gpt_weight", "gpt_weights")), ("sovits_checkpoint", ("sovits_weights_path", "sovits_checkpoint", "sovits_weight", "sovits_weights"))):
+        selected = next((str(params[key]) for key in aliases if params.get(key)), "")
+        if selected:
+            inputs[node_key] = PureWindowsPath(selected).name
     return _base_workflow("gpt-sovits", params, inputs)
 
 

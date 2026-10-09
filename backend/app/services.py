@@ -285,13 +285,19 @@ class ServiceRegistry:
         )
 
 
+def _comfyui_reference_path(engine: str, parameters: dict[str, Any]) -> str:
+    keys = {
+        'gpt-sovits': ('ref_audio_path', 'reference_audio'),
+        'indextts': ('voice', 'ref_audio_path', 'reference_audio'),
+        'cosyvoice': ('prompt_audio_path', 'reference_audio', 'ref_audio_path'),
+    }.get(engine, ('ref_audio_path', 'reference_audio', 'prompt_audio_path'))
+    return next((str(parameters[key]) for key in keys if parameters.get(key)), '')
+
+
 def build_load_signature(endpoint: TTSServiceEndpoint, parameters: dict[str, Any]) -> str:
     if endpoint.api_contract in COMFYUI_TTS_CONTRACTS:
-        reference_audio = parameters.get(
-            "reference_audio",
-            parameters.get("ref_audio_path", parameters.get("prompt_audio_path", "")),
-        )
         engine = parameters.get("engine") or (endpoint.engine.value if endpoint.engine else "")
+        reference_audio = _comfyui_reference_path(engine, parameters)
         provider = endpoint.provider_type.value if endpoint.provider_type else ""
         parts = [
             f"service_id={endpoint.service_id}",
@@ -303,6 +309,8 @@ def build_load_signature(endpoint: TTSServiceEndpoint, parameters: dict[str, Any
             f"instruct_text={parameters.get('instruct_text', parameters.get('instruction', ''))}",
             f"speed={parameters.get('speed', '')}",
             f"seed={parameters.get('seed', '')}",
+            f"gpt_checkpoint={parameters.get('gpt_weights_path') or parameters.get('gpt_checkpoint') or parameters.get('gpt_weight') or parameters.get('gpt_weights', '')}",
+            f"sovits_checkpoint={parameters.get('sovits_weights_path') or parameters.get('sovits_checkpoint') or parameters.get('sovits_weight') or parameters.get('sovits_weights', '')}",
         ]
         return "|".join(parts)
     if endpoint.provider_type == ProviderType.GPT_SOVITS or endpoint.engine == EngineName.GPT_SOVITS:
@@ -1986,14 +1994,7 @@ class ComfyUITTSClient:
         )
         params = {**self.endpoint.default_params, **request.parameters}
         params["text"] = request.line.text
-        reference_path = next(
-            (
-                str(params[key])
-                for key in ("reference_audio", "ref_audio_path", "prompt_audio_path")
-                if params.get(key)
-            ),
-            "",
-        )
+        reference_path = _comfyui_reference_path(str(engine_value), params)
         asset_id: str | None = None
         prompt_id: str | None = None
         prompt_converged = False
