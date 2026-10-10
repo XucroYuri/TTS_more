@@ -4,6 +4,7 @@ from pathlib import Path
 import subprocess
 import threading
 import time
+import wave
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
@@ -2847,7 +2848,13 @@ def test_character_library_scan_import_and_delete_guard(tmp_path: Path) -> None:
     (reference_root / "1小品-斯月学杨师版-25.11.25").mkdir(parents=True)
     gpt_root.mkdir()
     sovits_root.mkdir()
-    (reference_root / "1小品-斯月学杨师版-25.11.25" / "ref.wav").write_bytes(b"wav")
+    reference = reference_root / "1小品-斯月学杨师版-25.11.25" / "ref.wav"
+    with wave.open(str(reference), "wb") as recording:
+        recording.setnchannels(1)
+        recording.setsampwidth(2)
+        recording.setframerate(8000)
+        recording.writeframes(b"\x00\x00" * 32000)
+    reference.with_suffix(".txt").write_text("参考音频标注。", encoding="utf-8")
     (gpt_root / "1小品-斯月学杨师版-e50.ckpt").write_bytes(b"gpt")
     (sovits_root / "1小品-斯月学杨师版_e24_s360.pth").write_bytes(b"sovits")
     client = TestClient(create_app(data_root=tmp_path, reference_audio_root=reference_root))

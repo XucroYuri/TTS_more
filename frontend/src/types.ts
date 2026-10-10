@@ -377,6 +377,7 @@ export interface RoleLibraryCandidate {
   logs_id?: string;
   logs_name?: string;
   service_id?: string | null;
+  model_version?: string;
   source?: "filesystem" | "gradio" | "merged" | string;
   sample_count?: number;
   has_training_data?: boolean;
@@ -405,6 +406,7 @@ export interface LogsReferenceAudioSample {
   prompt_lang?: string;
   source: "logs" | "refdir" | string;
   logs_name?: string;
+  duration_seconds?: number | null;
 }
 
 export interface LogsReferenceAudioResponse {
