@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { applyLogsReferenceSampleToConfig, selectedLogsReferenceSample } from "./gptSovitsReference";
+import { applyLogsReferenceSampleToConfig, gptReferenceAudioConfig, selectedLogsReferenceSample } from "./gptSovitsReference";
 
 describe("GPT-SoVITS logs reference helpers", () => {
   const sample = {
@@ -41,5 +41,15 @@ describe("GPT-SoVITS logs reference helpers", () => {
 
     expect(selectedLogsReferenceSample([sample], config, { serviceId: "lan-gpt-a" })).toEqual(sample);
     expect(selectedLogsReferenceSample([sample], config, { serviceId: "lan-gpt-b" })).toBeUndefined();
+  });
+
+  it("clears previous annotation and sample identity when a new unannotated recording is selected", () => {
+    const previous = applyLogsReferenceSampleToConfig({reference_audio: "stale.wav"}, sample, {serviceId: "lan-gpt-a"});
+    const next = {...previous, ...gptReferenceAudioConfig({path: "new-upload.wav"})};
+    expect(next.ref_audio_path).toBe("new-upload.wav");
+    expect(next.prompt_text).toBeNull();
+    expect(next.reference_audio).toBeNull();
+    expect(selectedLogsReferenceSample([sample], next, {serviceId: "lan-gpt-a"})).toBeUndefined();
+    expect({...next, ...gptReferenceAudioConfig(null)}.ref_audio_path).toBeNull();
   });
 });

@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import math
 import re
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
+
+import soundfile
 
 from app.models import (
     Character,
@@ -147,12 +152,19 @@ def scan_gpt_sovits_model_catalog_candidates(
         _merge_model_catalog_candidate(grouped, _logs_candidate_from_scan(candidate, service_id=candidate.get("service_id") or service_id, source=candidate.get("source", "gradio")))
     for candidate in api_candidates or []:
         _merge_model_catalog_candidate(grouped, _logs_candidate_from_scan(candidate, service_id=candidate.get("service_id") or service_id, source=candidate.get("source", "api_v2")))
-    for candidate in scan_role_library_candidates(reference_audio_root, gpt_weights_roots, sovits_weights_roots, logs_roots=logs_roots, limit=limit * 2):
+    for candidate in _scan_experiment_model_candidates(reference_audio_root, gpt_weights_roots, sovits_weights_roots, logs_roots or []):
         _merge_model_catalog_candidate(grouped, _logs_candidate_from_scan(candidate, service_id=service_id, source="filesystem"))
     candidates = list(grouped.values())
     for candidate in candidates:
+        service_identity = str(candidate.get("service_id") or "filesystem")
+        candidate["id"] = f"{candidate['id']}-{hashlib.sha256(service_identity.encode()).hexdigest()[:8]}"
         candidate["sample_count"] = max(int(candidate.get("sample_count") or 0), _candidate_reference_sample_count(candidate))
         candidate["has_training_data"] = bool(candidate.get("has_training_data") or candidate["sample_count"] > 0)
+        recommended = _first_gpt_reference_sample([
+            ReferenceAudioGroup.model_validate(group)
+            for group in candidate.get("reference_audio_groups", [])
+        ])
+        candidate["recommended_ref_audio_path"] = recommended.path if recommended else None
     candidates.sort(key=lambda item: (0 if item.get("recommended_gpt_weights_path") and item.get("recommended_sovits_weights_path") else 1, item["logs_name"]))
     return candidates[:limit]
 
@@ -195,6 +207,7 @@ def scan_logs_reference_audio_samples(logs_roots: list[Path], logs_name: str, li
                     "prompt_lang": prompt_lang,
                     "source": "logs",
                     "logs_name": logs_dir.name,
+                    "duration_seconds": sidecar_sample.duration_seconds,
                 }
             )
             if len(samples) >= limit:
@@ -211,7 +224,7 @@ def candidate_to_character(candidate: dict[str, Any]) -> Character:
     gpt_path = candidate.get("recommended_gpt_weights_path")
     sovits_path = candidate.get("recommended_sovits_weights_path")
     groups = [ReferenceAudioGroup.model_validate(group) for group in candidate.get("reference_audio_groups", [])]
-    first_sample = _first_sample(groups)
+    first_sample = _first_gpt_reference_sample(groups)
     prompt_text = first_sample.text if first_sample else ""
     ref_audio_path = first_sample.path if first_sample else None
     gpt_complete = bool(gpt_path and sovits_path and ref_audio_path)
@@ -250,6 +263,7 @@ def candidate_to_character(candidate: dict[str, Any]) -> Character:
             )
         )
     if groups:
+        index_sample = _first_sample(groups)
         profiles.append(
             VoiceProfile(
                 id=f"{character_id}-index",
@@ -262,7 +276,7 @@ def candidate_to_character(candidate: dict[str, Any]) -> Character:
                         provider_type="indextts",
                         service_id="local-indextts",
                         capabilities=["reference_audio_voice", "emotion_text"],
-                        config=_compact({"voice": ref_audio_path, "emotion_mode": "same_as_voice"}),
+                        config=_compact({"voice": index_sample.path if index_sample else None, "emotion_mode": "same_as_voice"}),
                     )
                 ],
                 config={},
@@ -449,6 +463,79 @@ def _collect_weight_candidates(grouped: dict[str, dict[str, Any]], kind: str, ro
                 item[f"{recommended}_score"] = score
 
 
+def _scan_experiment_model_candidates(reference_root: Path, gpt_roots: list[Path], sovits_roots: list[Path], logs_roots: list[Path]) -> list[dict[str, Any]]:
+    """Keep experiment identity in the model catalog, unlike the role library.
+
+    Pair checkpoints by exact training name and checkout/version directory.
+    Recordings attach only to the corresponding checkout and training session.
+    """
+    experiments: dict[tuple[str, str, str], dict[str, Any]] = {}
+
+    def experiment(source: Path, version: str, logs_name: str) -> dict[str, Any]:
+        scope = str(source.resolve()).casefold()
+        key = (scope, version.casefold(), logs_name.casefold())
+        if key not in experiments:
+            identity = hashlib.sha256("|".join(key).encode()).hexdigest()[:12]
+            experiments[key] = {
+                "id": f"{slugify_role_name(logs_name)}-{identity}", "logs_name": logs_name,
+                "name": _extract_role_name(logs_name), "aliases": [logs_name],
+                "gpt_weights": [], "sovits_weights": [], "reference_audio_groups": [],
+                "model_version": version,
+            }
+        return experiments[key]
+
+    for kind, roots, suffixes in (("gpt", gpt_roots, GPT_WEIGHT_SUFFIXES), ("sovits", sovits_roots, SOVITS_WEIGHT_SUFFIXES)):
+        for root in roots:
+            if not root.is_dir():
+                continue
+            version = re.sub(r"^(?:gpt|sovits)(?:[_-]weights)?[_-]?", "", root.name, flags=re.IGNORECASE)
+            for path in root.rglob("*"):
+                if not path.is_file() or path.suffix.lower() not in suffixes:
+                    continue
+                logs_name = _extract_logs_name_from_weight(path.stem, preserve_prefix=True)
+                item = experiment(root.parent, version, logs_name)
+                score = _weight_score(path.stem)
+                item[f"{kind}_weights"].append({"name": path.name, "path": str(path), "score": score})
+                recommended = f"recommended_{kind}_weights_path"
+                if recommended not in item or score > item.get(f"{recommended}_score", (-1, -1)):
+                    item[recommended] = str(path)
+                    item[f"{recommended}_score"] = score
+
+    references: dict[str, dict[str, Any]] = {}
+    _collect_logs_reference_candidates(references, logs_roots)
+    for role in references.values():
+        for group in role["reference_audio_groups"]:
+            training = Path(group["paths"][0]).parent
+            scope = str(training.parent.parent.resolve()).casefold()
+            matches = [item for key, item in experiments.items() if key[0] == scope and key[2] == training.name.casefold()]
+            if not matches:
+                matches = [experiment(training.parent.parent, "", training.name)]
+            for item in matches:
+                item["reference_audio_groups"].append(group)
+
+    references = {}
+    _collect_reference_candidates(references, reference_root)
+    for role in references.values():
+        for group in role["reference_audio_groups"]:
+            name = group["id"]
+            matches = [item for key, item in experiments.items() if key[2] == name.casefold()]
+            # A generic role folder cannot prove a mapping to one experiment.
+            if len(matches) == 1:
+                matches[0]["reference_audio_groups"].append(group)
+            elif not matches:
+                experiment(reference_root, "", name)["reference_audio_groups"].append(group)
+
+    counts: dict[str, int] = {}
+    for key in experiments:
+        counts[key[2]] = counts.get(key[2], 0) + 1
+    for key, item in experiments.items():
+        if counts[key[2]] > 1:
+            item["catalog_variant"] = hashlib.sha256("|".join(key[:2]).encode()).hexdigest()[:12]
+            if item["model_version"]:
+                item["name"] = f"{item['name']} · {item['model_version']}"
+    return list(experiments.values())
+
+
 def _collect_reference_candidates(grouped: dict[str, dict[str, Any]], root: Path) -> None:
     if not root.exists() or not root.is_dir():
         return
@@ -468,7 +555,7 @@ def _collect_reference_candidates(grouped: dict[str, dict[str, Any]], root: Path
                 id=child.name,
                 name=child.name,
                 paths=[str(child)],
-                samples=samples[:8],
+                samples=samples,
             ).model_dump(mode="json")
         )
 
@@ -492,10 +579,8 @@ def _collect_logs_reference_candidates(grouped: dict[str, dict[str, Any]], roots
                 if not sample.text:
                     text = text_by_name.get(path.name) or text_by_name.get(path.stem) or ""
                     if text:
-                        sample = ReferenceAudioSample(path=str(path), text=text, text_source="sidecar")
+                        sample = sample.model_copy(update={"text": text, "text_source": "sidecar"})
                 samples.append(sample)
-                if len(samples) >= 8:
-                    break
             if not samples:
                 continue
             name = _extract_role_name(logs_dir.name)
@@ -621,8 +706,8 @@ def _extract_role_name(raw: str) -> str:
     return text or raw
 
 
-def _extract_logs_name_from_weight(raw: str) -> str:
-    text = re.sub(r"^\d+", "", raw).strip()
+def _extract_logs_name_from_weight(raw: str, preserve_prefix: bool = False) -> str:
+    text = (raw if preserve_prefix else re.sub(r"^\d+", "", raw)).strip()
     cleanup_patterns = [
         r"(?:[-_])e\d+(?:[-_])s\d+$",
         r"(?:[-_])e\d+$",
@@ -655,7 +740,21 @@ def _reference_sample(path: Path) -> ReferenceAudioSample:
             text = _read_text_sidecar(sidecar)
             text_source = "sidecar" if text else "none"
             break
-    return ReferenceAudioSample(path=str(path), text=text, text_source=text_source)
+    try:
+        stat = path.stat()
+        duration = _audio_duration(str(path), stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        duration = None
+    return ReferenceAudioSample(path=str(path), text=text, text_source=text_source, duration_seconds=duration)
+
+
+@lru_cache(maxsize=8192)
+def _audio_duration(path: str, modified_ns: int, size: int) -> float | None:
+    # File identity is part of the cache key so changed recordings are re-read.
+    try:
+        return soundfile.info(path).duration
+    except (OSError, RuntimeError, ValueError):
+        return None
 
 
 def _read_text_sidecar(path: Path) -> str:
@@ -676,6 +775,20 @@ def _first_sample(groups: list[ReferenceAudioGroup]) -> ReferenceAudioSample | N
     for group in groups:
         if group.samples:
             return group.samples[0]
+    return None
+
+
+def _first_gpt_reference_sample(groups: list[ReferenceAudioGroup]) -> ReferenceAudioSample | None:
+    """Choose only annotated recordings with a verified GPT reference duration.
+
+    Remote legacy samples without duration metadata remain visible for explicit
+    selection, but cannot safely become an automatic default.
+    """
+    for group in groups:
+        for sample in group.samples:
+            duration = sample.duration_seconds
+            if sample.text.strip() and duration is not None and math.isfinite(duration) and 3 <= duration <= 10:
+                return sample
     return None
 
 
@@ -751,6 +864,8 @@ def _merge_logs_candidate(grouped: dict[str, dict[str, Any]], candidate: dict[st
 
 def _merge_model_catalog_candidate(grouped: dict[str, dict[str, Any]], candidate: dict[str, Any]) -> None:
     key = f"{candidate.get('service_id') or 'filesystem'}::{_normalize(str(candidate.get('logs_name') or candidate.get('name') or candidate.get('id') or ''))}"
+    if candidate.get("catalog_variant"):
+        key += f"::{candidate['catalog_variant']}"
     if key not in grouped:
         grouped[key] = candidate
         return

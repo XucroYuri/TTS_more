@@ -84,9 +84,10 @@ import { WaveformPlayer } from "./components/WaveformPlayer";
 import { TokenGate } from "./components/TokenGate";
 import { generationFailureView, generationVersionTags, groupGenerationVersions, newestPlayableVersion, versionToInspectorDraft, type InspectorVersionDraft } from "./lib/generationHistory";
 import { generationStatusCounts, generationStatusKey, generationStatusTone, generationTerminalNotice, isTerminalGenerationStatus, reconcileGenerationJobSnapshot, type GenerationStatusTone } from "./lib/generationStatus";
-import { applyLogsReferenceSampleToConfig, selectedLogsReferenceSample } from "./lib/gptSovitsReference";
+import { applyLogsReferenceSampleToConfig, gptReferenceAudioConfig, selectedLogsReferenceSample } from "./lib/gptSovitsReference";
 import { formatScriptNote } from "./lib/lineNote";
-import { firstReferenceSampleFromModel, gptSovitsProjectBindingFromModel } from "./lib/modelCatalog";
+import { firstReferenceSampleFromModel, gptSovitsExperimentConfig, gptSovitsExperimentInputValue, gptSovitsExperimentOptions, gptSovitsProjectBindingFromModel, isSelectableGptReferenceSample, isUsableGptReferenceSample, resolveGptSovitsExperiment } from "./lib/modelCatalog";
+import { useGptSovitsModelCatalog } from "./lib/useGptSovitsModelCatalog";
 import { ensureProjectCharacters, freezeProjectCharacterLocally, projectCharacterRows, resolveProjectCharacters } from "./lib/projectCharacters";
 import { bindingCompleteness, catalogServiceOptions, roleLibraryBindingRows, roleLibraryDetailSelection, roleLibraryReferencePreview, roleLibraryServiceOptions, selectedCatalogServiceId } from "./lib/roleLibraryView";
 import { configForService, engineProvider, serviceEngineProvider } from "./lib/ttsProvider";
@@ -484,7 +485,7 @@ export default function App() {
     : "";
   const activeModelSamplesPayload = activeModelSamplesKey ? modelCatalogSamples[activeModelSamplesKey] : undefined;
   const activeModelSamples = activeModelSamplesPayload?.samples ?? [];
-  const activeModelSelectedSample = activeModelSamples.find((sample) => sample.sample_id === activeModelSampleId) ?? activeModelSamples[0] ?? (activeModelCatalogItem ? firstReferenceSampleFromModel(activeModelCatalogItem) : null);
+  const activeModelSelectedSample = activeModelSamples.find((sample) => sample.sample_id === activeModelSampleId) ?? activeModelSamples.find(isUsableGptReferenceSample) ?? (activeModelCatalogItem ? firstReferenceSampleFromModel(activeModelCatalogItem) : null);
   const preflightByLine = useMemo(() => new Map((preflightResult?.items ?? []).map((item) => [item.line_uid ?? item.line_id, item])), [preflightResult]);
   const activeLine = useMemo(() => project.lines.find((line) => line.id === activeLineId) ?? project.lines[0], [activeLineId, project.lines]);
   const activeRoleRow = useMemo(
@@ -695,6 +696,7 @@ export default function App() {
   );
   const serviceById = useMemo(() => new Map(visibleServices.map((service) => [service.service_id ?? "", service])), [visibleServices]);
   const activeService = activeServiceId ? serviceById.get(activeServiceId) : undefined;
+  const inspectorGptModels = useGptSovitsModelCatalog(activeProvider === "gpt-sovits" ? activeServiceId || null : null);
   const activeProfileValue = activeLine ? activeVersionDraft?.profile ?? lineProfile(activeLine, resolvedCharacters) : "";
   const activeProfileLabel = activeLine?.temporary_binding
     ? t("inspector.temporaryBinding")
@@ -2662,8 +2664,8 @@ export default function App() {
                                       </select>
                                     </div>
                                     <div className="role-model-actions">
-                                      <button className="primary-button compact-button" onClick={bindActiveModelToProjectRole} disabled={!activeProjectCharacter}>{t("characters.bindToProjectRole")}</button>
-                                      <button className="secondary-button compact-button" onClick={writeActiveModelToLibrary} disabled={!activeProjectCharacter}>{t("characters.writeToLibrary")}</button>
+                                      <button className="primary-button compact-button" onClick={bindActiveModelToProjectRole} disabled={!activeProjectCharacter || !activeModelCatalogItem.recommended_gpt_weights_path || !activeModelCatalogItem.recommended_sovits_weights_path}>{t("characters.bindToProjectRole")}</button>
+                                      <button className="secondary-button compact-button" onClick={writeActiveModelToLibrary} disabled={!activeProjectCharacter || !activeModelCatalogItem.recommended_gpt_weights_path || !activeModelCatalogItem.recommended_sovits_weights_path}>{t("characters.writeToLibrary")}</button>
                                       <button className="secondary-button compact-button" onClick={clearActiveProjectRoleBinding} disabled={!activeProjectCharacter?.project_binding}>{t("characters.clearProjectBinding")}</button>
                                     </div>
                                     <div className="role-detail-card">
@@ -2824,7 +2826,13 @@ export default function App() {
                                           <div className="role-config-form">
                                             <label>
                                               <span>{t("characters.logsName")}</span>
-                                              <input value={stringConfigValue(gptConfig.logs_name)} onChange={(event) => updateLibraryBindingConfig(activeLibraryCharacter.id, gptBinding.binding_id, { logs_name: event.target.value })} />
+                                              <input value={gptSovitsExperimentInputValue(gptConfig, gptModelCatalog.filter((model) => model.service_id === gptBinding.service_id))} list="library-gpt-experiments" onChange={(event) => {
+                                                const model = resolveGptSovitsExperiment(event.target.value, gptModelCatalog.filter((item) => item.service_id === gptBinding.service_id));
+                                                updateLibraryBindingConfig(activeLibraryCharacter.id, gptBinding.binding_id, gptSovitsExperimentConfig(model?.logs_name || model?.name || event.target.value, model));
+                                              }} />
+                                              <datalist id="library-gpt-experiments">
+                                                {gptSovitsExperimentOptions(gptModelCatalog.filter((model) => model.service_id === gptBinding.service_id)).map((option) => <option key={option.model.id} value={option.value} />)}
+                                              </datalist>
                                             </label>
                                             <label>
                                               <span>{t("services.selectedService")}</span>
@@ -2855,7 +2863,7 @@ export default function App() {
                                             </label>
                                             <label>
                                               <span>{t("characters.referenceAudio")}</span>
-                                              <select value={stringConfigValue(gptConfig.ref_audio_path)} onChange={(event) => updateLibraryBindingConfig(activeLibraryCharacter.id, gptBinding.binding_id, { ref_audio_path: event.target.value })}>
+                                              <select value={stringConfigValue(gptConfig.ref_audio_path)} onChange={(event) => updateLibraryBindingConfig(activeLibraryCharacter.id, gptBinding.binding_id, gptReferenceAudioConfig(referenceSamples.find((sample) => sample.path === event.target.value)))}>
                                                 <option value="">{t("status.unset")}</option>
                                                 {referenceSamples.map((sample) => (
                                                   <option value={sample.path} key={sample.path}>{shortPath(sample.path)}</option>
@@ -3340,9 +3348,9 @@ export default function App() {
                           <div className="gpt-resource-summary-grid">
                             <div>
                               <span>{t("characters.logsName")}</span>
-                              <input value={stringConfig(activeBindingConfig.logs_name)} list="inspector-gpt-experiments" aria-label={t("characters.logsName")} onChange={(event) => selectActiveExperiment(event.target.value)} />
+                              <input value={gptSovitsExperimentInputValue(activeBindingConfig, inspectorGptModels)} list="inspector-gpt-experiments" aria-label={t("characters.logsName")} onChange={(event) => selectActiveExperiment(event.target.value)} />
                               <datalist id="inspector-gpt-experiments">
-                                {gptModelCatalog.filter((model) => !activeServiceId || model.service_id === activeServiceId).map((model) => <option key={model.id} value={model.logs_name ?? model.name} />)}
+                                {gptSovitsExperimentOptions(inspectorGptModels).map((option) => <option key={option.model.id} value={option.value} />)}
                               </datalist>
                             </div>
                             <div>
@@ -3400,7 +3408,7 @@ export default function App() {
                                       >
                                         <option value="">{activeLogsReferenceRequest ? t("status.unset") : t("inspector.logsReferenceNeedsLogs")}</option>
                                         {activeLogsReferenceSamples.map((sample) => (
-                                          <option value={sample.sample_id} key={sample.sample_id}>{sample.display_label}</option>
+                                          <option value={sample.sample_id} key={sample.sample_id} disabled={!isSelectableGptReferenceSample(sample)}>{sample.display_label}{typeof sample.duration_seconds === "number" ? ` · ${sample.duration_seconds.toFixed(2)}s` : ""}</option>
                                         ))}
                                       </select>
                                     </label>
@@ -4056,6 +4064,9 @@ export default function App() {
                       ...bindingPatch,
                       config: {
                         ...(binding.config ?? {}),
+                        ...(bindingPatch.service_id !== undefined && bindingPatch.service_id !== binding.service_id
+                          ? { gpt_model_catalog_id: null, gpt_model_version: null }
+                          : {}),
                         ...configPatch,
                       },
                     }
@@ -4145,7 +4156,7 @@ export default function App() {
             ...profile,
             bindings: (profile.bindings ?? []).map((binding) => (
               binding.binding_id === bindingId
-                ? { ...binding, config: { ...(binding.config ?? {}), ref_audio_path: payload.sample.path } }
+                ? { ...binding, config: { ...(binding.config ?? {}), ...gptReferenceAudioConfig(payload.sample) } }
                 : binding
             ))
           }))
@@ -4163,7 +4174,7 @@ export default function App() {
     if (provider === "indextts") {
       updateActiveBindingConfig({ voice: path || undefined });
     } else if (provider === "gpt-sovits") {
-      updateActiveBindingConfig({ ref_audio_path: path || undefined });
+      updateActiveBindingConfig(gptReferenceAudioConfig(path ? {path} : null));
     } else if (provider === "cosyvoice") {
       updateActiveBindingConfig({ prompt_audio_path: path || undefined });
     } else {
@@ -4177,10 +4188,9 @@ export default function App() {
     setNotice(t("notice.logsReferenceApplied"));
   }
 
-  function selectActiveExperiment(logsName: string) {
-    const model = gptModelCatalog.find((item) => item.service_id === activeServiceId && (item.logs_name ?? item.name) === logsName);
-    const config = model ? gptSovitsProjectBindingFromModel(activeLine?.character_id ?? "line", model).config : { logs_name: logsName };
-    updateActiveBindingConfig(config);
+  function selectActiveExperiment(value: string) {
+    const model = resolveGptSovitsExperiment(value, inspectorGptModels);
+    updateActiveBindingConfig(gptSovitsExperimentConfig(model?.logs_name || model?.name || value, model));
   }
 
   async function uploadLineReference(file: File | undefined, target: "voice" | "emotion_audio" | "ref_audio_path" | "prompt_audio_path") {
@@ -4192,7 +4202,9 @@ export default function App() {
     setNotice(t("notice.uploadingReference"));
     try {
       const payload = await uploadProjectReferenceAudio(currentProjectId, file);
-      updateActiveBindingConfig({ [target]: payload.sample.path });
+      updateActiveBindingConfig(target === "ref_audio_path"
+        ? gptReferenceAudioConfig(payload.sample)
+        : { [target]: payload.sample.path });
       setNotice(t("notice.referenceUploaded"));
     } catch (error) {
       setNotice(error instanceof Error ? error.message : t("notice.referenceUploadFailed"));
@@ -4426,6 +4438,8 @@ function clearServiceScopedBindingConfig(provider: ProviderType, config: Record<
     "logs_reference_label",
     "logs_reference_service_id",
     "logs_reference_logs_name",
+    "gpt_model_catalog_id",
+    "gpt_model_version",
   ]) {
     delete next[key];
   }

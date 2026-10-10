@@ -1,4 +1,16 @@
-import type { LogsReferenceAudioSample } from "../types";
+import type { LogsReferenceAudioSample, ReferenceAudioSample } from "../types";
+
+export function gptReferenceAudioConfig(sample?: ReferenceAudioSample | null): Record<string, unknown> {
+  return {
+    reference_audio: null,
+    ref_audio_path: sample?.path ?? null,
+    prompt_text: sample?.text ?? null,
+    logs_reference_sample_id: null,
+    logs_reference_label: null,
+    logs_reference_service_id: null,
+    logs_reference_logs_name: null,
+  };
+}
 
 export function applyLogsReferenceSampleToConfig(
   currentConfig: Record<string, unknown>,
@@ -8,7 +20,8 @@ export function applyLogsReferenceSampleToConfig(
   return {
     ...currentConfig,
     ref_audio_path: sample.path,
-    prompt_text: sample.text || currentConfig.prompt_text,
+    reference_audio: null,
+    prompt_text: sample.text || null,
     prompt_lang: sample.prompt_lang || currentConfig.prompt_lang || "zh",
     logs_reference_sample_id: sample.sample_id,
     logs_reference_label: sample.display_label,
