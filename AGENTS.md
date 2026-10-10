@@ -103,6 +103,8 @@ Three core boundaries:
 8. **Security**: SSRF protection via `net_guard.py`, path safety via `path_safety.py`, optional token auth.
 9. **Testing**: `pytest` for backend, `vitest` for frontend. Backend tests in `backend/tests/`, frontend tests co-located or in `frontend/e2e/`.
 10. **Makefile available**: `make install` for cross-platform dependency setup.
+11. **Windows command memory**: Before running Windows shell commands, read `docs/windows-agent-memory.md` and follow its quoting, encoding, temporary-directory, and sandbox diagnostics rules.
+12. **Production GPU sharing**: Keep independently running native TTS applications open. GPU coordination must use trustworthy task lifecycle signals, a continuous five-minute idle interval, and supported offload/reload controls. See `docs/native-gpu-coordination.md`; an empty Gradio waiting queue or low GPU utilization is insufficient proof of idle state.
 
 ## Avoid
 

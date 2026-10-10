@@ -4713,6 +4713,7 @@ function statusText(status: string, t: Translate): string {
     cancelling: "status.cancelling",
     cancelled: "status.cancelled",
     queued: "status.queued",
+    "waiting native gpu": "status.waitingNativeGpu",
     ready: "status.ready",
     "not generated": "status.notGenerated",
     "needs key": "status.needsKey",

@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from app.adapters.base import SynthesisCancelled, SynthesisRequest, SynthesisTimeout
+from app.adapters.base import SynthesisCancelled, SynthesisCoordinationError, SynthesisPreempted, SynthesisRequest, SynthesisTimeout
 from app.comfyui.output import TEMPORARY_WAV_NAME_UNITS
 from app.models import EngineName, GenerationJob, GenerationManifest, GenerationQueueItem, GenerationStatus, GenerationTask, GenerationVersion, ProviderType
 from app.net_guard import scrub_error
@@ -318,16 +318,25 @@ class ServiceGenerationQueue:
                         raise
                     self._mark_loaded(task_route.endpoint.service_id, task_signature, "loaded_unverified")
                 self._active_resource_services[resource_group] = (task_route.endpoint.service_id, task_route.client)
-                self._run_task(
-                    task_route,
-                    task,
-                    manifest,
-                    output_dir,
-                    task_cluster_key,
-                    status_callback,
-                    cancel_check,
-                    output_namespace,
-                )
+                while True:
+                    if cancel_check and cancel_check():
+                        return
+                    try:
+                        self._run_task(
+                            task_route,
+                            task,
+                            manifest,
+                            output_dir,
+                            task_cluster_key,
+                            status_callback,
+                            cancel_check,
+                            output_namespace,
+                        )
+                        break
+                    except SynthesisPreempted:
+                        # Retry exactly this uncommitted line. Other resource
+                        # groups use their own worker and keep progressing.
+                        threading.Event().wait(0.5)
 
     def _run_task(
         self,
@@ -393,7 +402,10 @@ class ServiceGenerationQueue:
                 return
             load_verification_level = str(result.metadata.get("load_verification_level", "assumed_after_success"))
             verified_load_signature = str(result.metadata.get("verified_load_signature") or requested_load_signature)
-            self._mark_loaded(route.endpoint.service_id, verified_load_signature, load_verification_level)
+            if result.metadata.get("runtime_released"):
+                self._forget_released_runtime(route)
+            else:
+                self._mark_loaded(route.endpoint.service_id, verified_load_signature, load_verification_level)
             version = GenerationVersion(
                 version_id=version_id,
                 line_uid=_task_line_uid(task),
@@ -419,6 +431,22 @@ class ServiceGenerationQueue:
                     "load_verification_level": load_verification_level,
                 },
             )
+        except SynthesisPreempted as exc:
+            cleanup_errors = self._discard_uncommitted_output(output_path)
+            self._forget_released_runtime(route)
+            if exc.details.get("cleanup_confirmed") is not True or cleanup_errors:
+                failure = SynthesisCoordinationError("GPU preemption cleanup was not confirmed", details=self._with_output_cleanup_errors(exc.details, cleanup_errors))
+                failed_id = self._append_failed_version(route, task, manifest, cluster_key, "gpu_cleanup", failure, control_code=failure.code, control_details=failure.details)
+                self._emit(task, "failed", 1.0, cluster_key, failed_id, status_callback)
+                raise failure from exc
+            self._emit(task, "queued", 0.0, cluster_key, None, status_callback, {"external_status": "waiting_native_gpu"})
+            raise
+        except SynthesisCoordinationError as exc:
+            cleanup_errors = self._discard_uncommitted_output(output_path)
+            self._forget_released_runtime(route)
+            failed_id = self._append_failed_version(route, task, manifest, cluster_key, "gpu_coordination", exc, control_code=exc.code, control_details=self._with_output_cleanup_errors(exc.details, cleanup_errors))
+            self._emit(task, "failed", 1.0, cluster_key, failed_id, status_callback)
+            raise
         except SynthesisCancelled as exc:
             cleanup_errors = self._discard_uncommitted_output(output_path)
             converged = exc.details.get("converged")
@@ -685,6 +713,16 @@ class ServiceGenerationQueue:
             "last_error_at": None,
         }
 
+    def _forget_released_runtime(self, route: ServiceRoute) -> None:
+        self._loaded_signatures.pop(route.endpoint.service_id, None)
+        self._active_resource_services.pop(route.endpoint.resource_group, None)
+        self._load_states[route.endpoint.service_id] = {
+            "verification_level": "unloaded_after_gpu_coordination",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "last_error": None,
+            "last_error_at": None,
+        }
+
     def _mark_load_failed(self, service_id: str, exc: Exception) -> None:
         current = self._load_states.get(service_id, {})
         self._load_states[service_id] = {
@@ -735,22 +773,7 @@ def build_cluster_key(task: GenerationTask, route: ServiceRoute) -> str:
     params = task.parameters
     if route.endpoint.api_contract in COMFYUI_TTS_CONTRACTS:
         effective_engine = str(params.get("engine") or (route.endpoint.engine.value if route.endpoint.engine else task.engine.value))
-        reference_audio = params.get(
-            "reference_audio",
-            params.get("ref_audio_path", params.get("prompt_audio_path", "")),
-        )
-        parts = [
-            f"provider={provider.value if provider else task.engine.value}",
-            f"engine={effective_engine}",
-            f"service_id={service_id}",
-            f"resource_id={params.get('resource_id', route.endpoint.default_params.get('resource_id', ''))}",
-            f"reference_audio={reference_audio}",
-            f"prompt_text={params.get('prompt_text', '')}",
-            f"instruct_text={params.get('instruct_text', params.get('instruction', ''))}",
-            f"speed={params.get('speed', '')}",
-            f"seed={params.get('seed', '')}",
-        ]
-        return "|".join(parts)
+        return build_load_signature(route.endpoint, {**params, "engine": effective_engine})
     if provider == ProviderType.GPT_SOVITS or task.engine == EngineName.GPT_SOVITS:
         parts = [
             f"provider=gpt-sovits",

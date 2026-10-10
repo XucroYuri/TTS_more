@@ -10,6 +10,8 @@ import httpx
 from app.adapters.base import (
     SynthesisCancelCheck,
     SynthesisCancelled,
+    SynthesisPreempted,
+    SynthesisCoordinationError,
     SynthesisTimeout,
 )
 from app.net_guard import scrub_error
@@ -86,9 +88,9 @@ class ComfyUIAPIClient:
             )
             response.raise_for_status()
 
-    def release_runtime(self, *, resource_id: str | None = None) -> dict[str, Any]:
+    def release_runtime(self, *, resource_id: str | None = None, timeout: float = 120.0) -> dict[str, Any]:
         payload = {"resource_id": resource_id} if resource_id else {"all": True}
-        with httpx.Client(timeout=120.0, transport=self.transport) as client:
+        with httpx.Client(timeout=timeout, transport=self.transport) as client:
             response = client.post(
                 f"{self.base_url}/api/tts-audio-suite/v1/runtime/release", json=payload
             )
@@ -346,6 +348,7 @@ class ComfyUIAPIClient:
         *,
         cancel_check: SynthesisCancelCheck | None = None,
         cancel_wait: float = 30.0,
+        preempt_check: SynthesisCancelCheck | None = None,
     ) -> dict[str, Any]:
         deadline = time.monotonic() + max_wait
 
@@ -390,6 +393,7 @@ class ComfyUIAPIClient:
                 if status.get("status_str") == "error":
                     messages = status.get("messages") or []
                     message: Any = messages[-1] if messages else "no output"
+                    exception_type = ""
                     for item in reversed(messages):
                         if (
                             isinstance(item, (list, tuple))
@@ -398,12 +402,25 @@ class ComfyUIAPIClient:
                             and isinstance(item[1], dict)
                         ):
                             message = item[1].get("exception_message") or item[1]
+                            exception_type = str(item[1].get("exception_type") or "")
                             break
+                    if "TTSMoreGPUCleanupFailed" in f"{exception_type} {message}":
+                        raise SynthesisCoordinationError("Suite GPU cleanup/admission was not confirmed", details={"prompt_id": prompt_id})
+                    if "TTSMoreGPUPreempted" in f"{exception_type} {message}":
+                        raise SynthesisPreempted(
+                            "ComfyUI yielded to native GPU priority",
+                            details={"prompt_id": prompt_id, "suite_preempted": True},
+                        )
                     raise RuntimeError(f"ComfyUI prompt failed: {message}")
                 if entry.get("outputs"):
                     return entry
                 if status.get("completed") is True:
                     raise RuntimeError("ComfyUI prompt failed: no output")
+            if preempt_check is not None and preempt_check():
+                raise SynthesisPreempted(
+                    "ComfyUI yielded to native GPU priority",
+                    details={"prompt_id": prompt_id, "cancellation": cancellation_details()},
+                )
             sleep_deadline = min(
                 deadline,
                 time.monotonic() + max(0.0, poll_interval),

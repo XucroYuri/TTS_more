@@ -1581,6 +1581,8 @@ class TestComfyUITTSClient:
 
         def handler(request: httpx.Request) -> httpx.Response:
             calls.append((request.url.path, json.loads(request.content) if request.content else None))
+            if request.url.path.endswith("/runtime/release"):
+                return httpx.Response(200, json={"released": [], "busy": [], "errors": []})
             return httpx.Response(200, json={"status": "ok"})
 
         endpoint = _cosyvoice_endpoint()
