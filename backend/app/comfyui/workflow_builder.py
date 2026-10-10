@@ -103,6 +103,11 @@ def build_cosyvoice_workflow(params: dict[str, Any]) -> dict[str, Any]:
 
 
 def build_indextts_workflow(params: dict[str, Any]) -> dict[str, Any]:
+    cuda_kernel = params.get("use_cuda_kernel", "auto")
+    if isinstance(cuda_kernel, bool):
+        cuda_kernel = str(cuda_kernel).lower()
+    elif cuda_kernel is None:
+        cuda_kernel = "auto"
     inputs = {
         "resource_id": _resource_id(params),
         "device": str(params.get("device", "auto")),
@@ -119,7 +124,7 @@ def build_indextts_workflow(params: dict[str, Any]) -> dict[str, Any]:
         "num_beams": int(params.get("num_beams", 3)),
         "repetition_penalty": float(params.get("repetition_penalty", 10.0)),
         "max_mel_tokens": int(params.get("max_mel_tokens", 1500)),
-        "use_cuda_kernel": str(params.get("use_cuda_kernel", "auto")),
+        "use_cuda_kernel": str(cuda_kernel).lower(),
         "use_deepspeed": bool(params.get("use_deepspeed", False)),
         "use_torch_compile": bool(params.get("use_torch_compile", False)),
         "use_accel": bool(params.get("use_accel", False)),

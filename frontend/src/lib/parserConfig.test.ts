@@ -82,6 +82,7 @@ describe("parser provider config helpers", () => {
       enabled: true,
       timeout_seconds: 45,
       priority: 102,
+      use_environment_proxy: true,
       key_configured: false,
       api_key: "",
     });
@@ -113,6 +114,7 @@ describe("parser provider config helpers", () => {
       enabled: true,
       timeout_seconds: 45,
       priority: 200,
+      use_environment_proxy: false,
       key_configured: false,
       api_key: "kwjm-secret",
     });

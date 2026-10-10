@@ -86,6 +86,8 @@ GPT 权重与 SoVITS 权重是一个可执行资源对。相似文件名只能�
 
 ## 快速开始
 
+Windows 本机可使用仓库根目录的 `Start-TTSMore.bat` 同时启动工作台与 ComfyUI；端口冲突时自动回退并同步地址。安装外部入口与配置说明见 [Windows 工作台启动](windows-workstation-launcher.md)，最新两引擎验收记录见 [2026-10-10 验收记录](acceptance-2026-10-10.md)。
+
 在 TTS More 工作台的 `接入 → TTS 服务` 页面添加 ComfyUI 端点。配置完成后，系统会将信息写入 `services.json`。
 
 配置示例：

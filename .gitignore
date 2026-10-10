@@ -69,3 +69,10 @@ data/projects/*/audio/
 resources.yaml
 data/test_output/
 backend/tests/test_output/
+# Machine-local analysis, voice indexes, audit screenshots and test scratch files.
+data/logs/
+data/semantic/
+data/voice_matching/
+.codex-audit/
+.pytest-warning-fixes/
+frontend/package-lock.json

@@ -269,6 +269,18 @@ def create_app(
     def auth_status() -> dict[str, Any]:
         return auth_status_endpoint()
 
+    @app.get("/api/ready")
+    def ready() -> dict[str, Any]:
+        # Startup checks must not wait for model workers or external API probes.
+        return {
+            "status": "ok", "project_root": str(project_root.resolve()), "pid": os.getpid(),
+            "comfyui_urls": {
+                service.service_id: service.base_url
+                for service in app.state.service_registry.services
+                if service.api_contract in {"comfyui-tts-v1", COMFYUI_TTS_AUDIO_SUITE_CONTRACT}
+            },
+        }
+
     @app.get("/api/health")
     def health() -> dict[str, Any]:
         return {
