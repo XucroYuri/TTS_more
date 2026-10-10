@@ -27,6 +27,18 @@ class SynthesisTimeout(SynthesisControlError):
     code = "timeout"
 
 
+class SynthesisPreempted(SynthesisControlError):
+    """Native GPU priority interrupted a line; retry only after proven cleanup."""
+
+    code = "gpu_preempted"
+
+
+class SynthesisCoordinationError(SynthesisControlError):
+    """Unknown or dirty GPU ownership must stop dispatch, never retry silently."""
+
+    code = "gpu_coordination_failed"
+
+
 @dataclass(frozen=True)
 class SynthesisRequest:
     line: ScriptLine

@@ -19,6 +19,8 @@ import httpx
 from app.adapters.base import (
     SynthesisCancelled,
     SynthesisControlError,
+    SynthesisCoordinationError,
+    SynthesisPreempted,
     SynthesisRequest,
     SynthesisResult,
     SynthesisTimeout,
@@ -1989,6 +1991,20 @@ class ComfyUITTSClient:
             return
 
     def _synthesize_impl(self, request: SynthesisRequest) -> SynthesisResult:
+        from app.comfyui.gpu_coordination import (
+            admission_probe, coordination_config, native_priority_pending, require_suite_coordination,
+        )
+
+        coordination = coordination_config(self.endpoint.resource_group)
+        coordinator = coordination.client() if coordination else None
+        if coordination:
+            try:
+                require_suite_coordination(self.api.bridge_capabilities(), coordination)
+            except SynthesisCoordinationError:
+                raise
+            except Exception as exc:
+                raise SynthesisCoordinationError("Suite GPU coordination capability unavailable") from exc
+            admission_probe(coordinator, coordination, f"tts-more:{uuid.uuid4().hex}")
         engine_value = request.parameters.get("engine") or (
             self.endpoint.engine.value if self.endpoint.engine else "cosyvoice"
         )
@@ -2031,6 +2047,7 @@ class ComfyUITTSClient:
                     if request.cancel_check is not None
                     else None
                 ),
+                **({"preempt_check": lambda: native_priority_pending(coordinator, coordination)} if coordination else {}),
             )
             prompt_converged = True
             output_files = self.api._extract_output_filenames(history_entry)
@@ -2066,12 +2083,46 @@ class ComfyUITTSClient:
                     prompt_converged = cancellation.get("converged") is True
                 else:
                     prompt_converged = exc.details.get("converged") is True
+        if coordination:
+            # Runtime/child cleanup is mandatory even for an execution error or
+            # coordinator outage. A dirty outcome stops the group, not a retry.
+            try:
+                cleanup_deadline = time.monotonic() + coordination.cleanup_timeout
+
+                def cleanup_budget() -> float:
+                    remaining = cleanup_deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise RuntimeError("GPU cleanup deadline exhausted")
+                    return remaining
+
+                prompt_state = "absent"
+                if prompt_id:
+                    prompt_state = self.api._queue_state(self.api.get_queue(timeout=cleanup_budget()), prompt_id)
+                if prompt_id and (not prompt_converged or prompt_state != "absent"):
+                    cancellation = self.api.cancel_prompt(prompt_id, max_wait=cleanup_budget())
+                    prompt_converged = cancellation.converged or cancellation.final_state in {"completed", "error", "interrupted"}
+                    queue = self.api.get_queue(timeout=cleanup_budget())
+                    prompt_converged = prompt_converged and self.api._queue_state(queue, prompt_id) == "absent"
+                if prompt_id and not prompt_converged:
+                    raise RuntimeError("Target ComfyUI prompt cleanup was not confirmed")
+                report = self.api.release_runtime(timeout=cleanup_budget())
+                if not isinstance(report, dict) or set(report) != {"released", "busy", "errors"} or report["busy"] or report["errors"]:
+                    raise RuntimeError("Suite runtime cleanup was not confirmed")
+                if isinstance(synthesis_error, SynthesisPreempted):
+                    synthesis_error.details["cleanup_confirmed"] = True
+                if result is not None:
+                    result.metadata["runtime_released"] = True
+            except Exception as exc:
+                synthesis_error = SynthesisCoordinationError("ComfyUI GPU cleanup was not confirmed")
+                synthesis_error.__cause__ = exc
         cleanup_error: Exception | None = None
         if asset_id and prompt_converged:
             try:
                 self.api.delete_audio(asset_id)
             except Exception as exc:
                 cleanup_error = exc
+        if coordination and cleanup_error is not None:
+            raise SynthesisCoordinationError("ComfyUI asset cleanup was not confirmed") from cleanup_error
         if synthesis_error is not None:
             if isinstance(synthesis_error, SynthesisControlError):
                 control_error = synthesis_error
@@ -2128,8 +2179,12 @@ class ComfyUITTSClient:
 
     def unload(self) -> None:
         resource_id = str(self.endpoint.default_params.get("resource_id", "")).strip()
-        self.api.release_runtime(resource_id=resource_id or None)
-        self.api.free_memory()
+        report = self.api.release_runtime(resource_id=resource_id or None)
+        if not isinstance(report, dict) or set(report) != {"released", "busy", "errors"} or report["busy"] or report["errors"]:
+            raise SynthesisCoordinationError("Suite runtime release was not confirmed")
+        free = self.api.free_memory()
+        if free.get("status") != "ok":
+            raise SynthesisCoordinationError("ComfyUI memory release was not confirmed")
 
 def _tiny_wav_bytes() -> bytes:
     return (

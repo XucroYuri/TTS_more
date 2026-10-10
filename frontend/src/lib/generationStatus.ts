@@ -1,5 +1,7 @@
 import type { GenerationJob, GenerationStatus, QueueItemStatus } from "../types";
 
+export type GenerationDisplayStatus = GenerationStatus | "waiting_native_gpu";
+
 export type GenerationStatusTone =
   | "idle"
   | "queued"
@@ -29,27 +31,29 @@ export const terminalGenerationStatuses = new Set<GenerationStatus>([
   "cancelled",
 ]);
 
-export function isTerminalGenerationStatus(status: GenerationStatus): boolean {
+export function isTerminalGenerationStatus(status: GenerationDisplayStatus): boolean {
+  if (status === "waiting_native_gpu") return false;
   return terminalGenerationStatuses.has(status);
 }
 
-export function generationStatusTone(status: GenerationStatus): GenerationStatusTone {
+export function generationStatusTone(status: GenerationDisplayStatus): GenerationStatusTone {
   if (status === "completed") return "completed";
   if (status === "failed") return "failed";
   if (status === "cancelled") return "cancelled";
-  if (status === "queued") return "queued";
+  if (status === "queued" || status === "waiting_native_gpu") return "queued";
   if (["loading", "running", "finalizing", "cancelling"].includes(status)) {
     return "running";
   }
   return "idle";
 }
 
-export function generationStatusKey(status: GenerationStatus): `status.${GenerationStatus}` {
+export function generationStatusKey(status: GenerationDisplayStatus): `status.${GenerationStatus}` | "status.waitingNativeGpu" {
+  if (status === "waiting_native_gpu") return "status.waitingNativeGpu";
   return `status.${status}`;
 }
 
 export function generationTerminalNotice(
-  status: GenerationStatus,
+  status: GenerationDisplayStatus,
 ): GenerationTerminalNotice | null {
   if (status === "completed") return { key: "notice.generated", level: "success" };
   if (status === "failed") return { key: "notice.generationFailed", level: "error" };
@@ -99,7 +103,7 @@ export function reconcileGenerationJobSnapshot(
 }
 
 export function generationStatusCounts(
-  statuses: readonly GenerationStatus[],
+  statuses: readonly GenerationDisplayStatus[],
 ): GenerationStatusCounts {
   const counts: GenerationStatusCounts = {
     queued: 0,

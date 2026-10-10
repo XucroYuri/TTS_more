@@ -250,6 +250,56 @@ def test_service_queue_preserves_old_load_state_when_resource_unload_fails(tmp_p
     assert manifest.lines["l2"].versions[0].metadata["failure_stage"] == "unloading"
 
 
+@pytest.mark.parametrize(
+    ("engine", "reference_field"),
+    [(EngineName.GPT_SOVITS, "ref_audio_path"), (EngineName.INDEX_TTS, "voice"), (EngineName.COSYVOICE, "prompt_audio_path")],
+)
+def test_comfyui_queue_batches_selected_reference_despite_stale_aliases(tmp_path: Path, engine: EngineName, reference_field: str) -> None:
+    service = endpoint("comfy-reference", engine, "comfy-gpu")
+    service.provider_type = ProviderType.COMFYUI
+    service.api_contract = "comfyui-tts-audio-suite-v1"
+    client = RecordingServiceClient(service)
+    queue = ServiceGenerationQueue(StaticRouter({service.service_id: client}))
+    manifest = GenerationManifest(project_id="demo")
+    tasks = [
+        task(line_id, engine, "voice", service.service_id).model_copy(update={
+            "parameters": {reference_field: selected, "reference_audio": stale, "resource_id": "trained-voice"},
+        })
+        for line_id, selected, stale in [("a1", "selected-a.wav", "old.wav"), ("b1", "selected-b.wav", "old.wav"), ("a2", "selected-a.wav", "older.wav")]
+    ]
+
+    queue.run(tasks, manifest, output_dir=tmp_path)
+
+    assert [call for call in client.calls if call.startswith("synthesize")] == ["synthesize:a1", "synthesize:a2", "synthesize:b1"]
+    a1 = manifest.lines["a1"].versions[0]
+    assert "reference_audio=selected-a.wav" in a1.metadata["cluster_key"]
+    assert a1.metadata["cluster_key"] == a1.requested_load_signature
+    assert a1.metadata["cluster_key"] == manifest.lines["a2"].versions[0].metadata["cluster_key"]
+    assert a1.metadata["cluster_key"] != manifest.lines["b1"].versions[0].metadata["cluster_key"]
+
+
+@pytest.mark.parametrize("checkpoint_field", ["gpt_weights_path", "sovits_weights_path"])
+def test_comfyui_queue_batches_independent_checkpoint_selections(tmp_path: Path, checkpoint_field: str) -> None:
+    service = endpoint("comfy-epochs", EngineName.GPT_SOVITS, "comfy-gpu")
+    service.provider_type = ProviderType.COMFYUI
+    service.api_contract = "comfyui-tts-audio-suite-v1"
+    client = RecordingServiceClient(service)
+    queue = ServiceGenerationQueue(StaticRouter({service.service_id: client}))
+    manifest = GenerationManifest(project_id="demo")
+    tasks = [
+        task(line_id, EngineName.GPT_SOVITS, "voice", service.service_id).model_copy(update={
+            "parameters": {"ref_audio_path": "selected.wav", checkpoint_field: checkpoint},
+        })
+        for line_id, checkpoint in [("a1", "epoch-a"), ("b1", "epoch-b"), ("a2", "epoch-a")]
+    ]
+
+    queue.run(tasks, manifest, output_dir=tmp_path)
+
+    assert [call for call in client.calls if call.startswith("synthesize")] == ["synthesize:a1", "synthesize:a2", "synthesize:b1"]
+    assert len([call for call in client.calls if call.startswith("load:")]) == 2
+    assert manifest.lines["a1"].versions[0].metadata["cluster_key"] != manifest.lines["b1"].versions[0].metadata["cluster_key"]
+
+
 def test_service_queue_clusters_same_weights_and_reference_before_switching(tmp_path: Path) -> None:
     client = RecordingServiceClient(endpoint("local-gpt", EngineName.GPT_SOVITS, "local-gpu-0"))
     queue = ServiceGenerationQueue(StaticRouter({"local-gpt": client}))
@@ -1626,7 +1676,10 @@ def test_fix_round_3_output_path_fails_before_synthesis_when_root_exhausts_windo
 def test_fix_round_5_output_path_reserves_atomic_wav_temp_name_budget(tmp_path: Path) -> None:
     output_root = tmp_path
     while windows_utf16_units(str(output_root.resolve(strict=False))) < 130:
-        output_root = output_root / "budget-segment"
+        remaining = 130 - windows_utf16_units(str(output_root.resolve(strict=False)))
+        if remaining == 1:
+            break
+        output_root = output_root / "budget-segment"[:remaining - 1]
 
     client = RecordingServiceClient(endpoint("safe-service", EngineName.GPT_SOVITS, "gpu-a"))
     queue = ServiceGenerationQueue(StaticRouter({"safe-service": client}))

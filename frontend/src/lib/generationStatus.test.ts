@@ -42,6 +42,9 @@ function job(
 
 describe("generation status semantics", () => {
   it("keeps cancelling active and cancelled non-failure", () => {
+    expect(isTerminalGenerationStatus("waiting_native_gpu")).toBe(false);
+    expect(generationStatusTone("waiting_native_gpu")).toBe("queued");
+    expect(generationTerminalNotice("waiting_native_gpu")).toBeNull();
     expect(isTerminalGenerationStatus("cancelling")).toBe(false);
     expect(isTerminalGenerationStatus("cancelled")).toBe(true);
     expect(generationStatusTone("cancelling")).toBe("running");
@@ -54,6 +57,7 @@ describe("generation status semantics", () => {
     expect(
       generationStatusCounts([
         "queued",
+        "waiting_native_gpu",
         "loading",
         "running",
         "finalizing",
@@ -63,13 +67,13 @@ describe("generation status semantics", () => {
         "cancelled",
       ]),
     ).toEqual({
-      queued: 1,
+      queued: 2,
       running: 4,
       completed: 1,
       failed: 1,
       cancelled: 1,
       processed: 3,
-      total: 8,
+      total: 9,
     });
   });
 
