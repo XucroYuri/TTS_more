@@ -39,10 +39,12 @@ def test_dry_validation_never_calls_network_or_writes_journal(tmp_path, monkeypa
         raise AssertionError("dry validation must not contact a control endpoint")
     monkeypatch.setattr(ControlClient, "call", forbidden)
     monkeypatch.setattr(launcher, "ControlServer", forbidden)
-    config = launcher.validate_coordinator_config(write_config(tmp_path, configuration()))
+    config_path = write_config(tmp_path, configuration())
+    existing_paths = set(tmp_path.rglob("*"))
+    config = launcher.validate_coordinator_config(config_path)
     assert Path(config["journal_path"]) == tmp_path / "private-state" / "journal.json"
     assert not (tmp_path / "private-state").exists()
-    assert sorted(path.name for path in tmp_path.iterdir()) == ["config.json"]
+    assert set(tmp_path.rglob("*")) == existing_paths
 
 
 @pytest.mark.parametrize("url", [
