@@ -1,4 +1,4 @@
-import { act, createElement } from "react";
+import { act, createElement, StrictMode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 // @ts-expect-error jsdom ships without declaration files in this project.
 import { JSDOM } from "jsdom";
@@ -363,7 +363,8 @@ async function renderAnalysisHook(
   storage: Storage | null,
   initialProjectId = "project-1",
   initialRevision = revision(),
-  overrides: Partial<UseAnalysisDraftOptions> = {}
+  overrides: Partial<UseAnalysisDraftOptions> = {},
+  strictMode = false
 ): Promise<RenderedHook> {
   const dom = new JSDOM("<div id=\"root\"></div>", {
     pretendToBeVisual: true,
@@ -397,7 +398,10 @@ async function renderAnalysisHook(
   }
 
   const root: Root = createRoot(dom.window.document.getElementById("root")!);
-  await act(async () => root.render(createElement(Harness, props)));
+  const renderHarness = () => strictMode
+    ? createElement(StrictMode, null, createElement(Harness, props))
+    : createElement(Harness, props);
+  await act(async () => root.render(renderHarness()));
 
   let cleaned = false;
   const cleanup = async () => {
@@ -421,7 +425,7 @@ async function renderAnalysisHook(
     },
     rerender: async (projectId, sourceRevision) => {
       props = { projectId, sourceRevision };
-      await act(async () => root.render(createElement(Harness, props)));
+      await act(async () => root.render(renderHarness()));
     },
     cleanup
   };
@@ -555,6 +559,19 @@ describe("applyDraftOperations", () => {
 });
 
 describe("analysis run restoration and polling", () => {
+  it("creates one run when StrictMode replays initialization before the POST resolves", async () => {
+    const response = deferred<Awaited<ReturnType<AnalysisDraftApi["createAnalysisRun"]>>>();
+    const api = makeApi({ createAnalysisRun: vi.fn(() => response.promise) });
+    const storage = new MemoryStorage();
+    const view = await renderAnalysisHook(api, storage, "project-1", revision(), {}, true);
+    expect(api.createAnalysisRun).toHaveBeenCalledOnce();
+    await act(async () => response.resolve({ run_id: "run-1", draft_id: "draft-1", status: "queued", trace_id: "trace-1" }));
+    await flushMicrotasks();
+    expect(view.current.run?.id).toBe("run-1");
+    expect(view.current.draft?.id).toBe("draft-1");
+    expect(api.createAnalysisRun).toHaveBeenCalledOnce();
+    expect(storage.getItem(ANALYSIS_RUN_SESSIONS_STORAGE_KEY)).toContain("run-1");
+  });
   it("attaches to the persisted project/revision run after reload without creating another run", async () => {
     const storage = new MemoryStorage();
     const firstApi = makeApi();

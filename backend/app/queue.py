@@ -238,8 +238,11 @@ class ServiceGenerationQueue:
         output_namespace: str | None = None,
     ) -> GenerationManifest:
         grouped: "OrderedDict[str, OrderedDict[str, list[tuple[int, GenerationTask, ServiceRoute, str]]]]" = OrderedDict()
+        # A settings reload may replace the router concurrently. Resolve a batch
+        # against one snapshot; its routes and resource locks remain usable.
+        router = self.router
         for index, task in enumerate(tasks):
-            route = self.router.resolve_task(task)
+            route = router.resolve_task(task)
             resource_group = route.endpoint.resource_group
             cluster_key = build_cluster_key(task, route)
             cluster_group = grouped.setdefault(resource_group, OrderedDict())

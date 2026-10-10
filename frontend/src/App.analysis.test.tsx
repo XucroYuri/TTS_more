@@ -361,6 +361,78 @@ afterEach(async () => {
 });
 
 describe("App semantic analysis entry", () => {
+  it("refreshes audio history when topology discovers an already completed job", async () => {
+    const projectId = "topology-history";
+    const project = scriptProject("终态任务历史");
+    project.lines = [{ id: "line", character_id: "role", text: "音频已完成", note: "", language: "zh-CN" }];
+    backendProjects.set(projectId, project);
+    apiMocks.fetchQueueStatus.mockResolvedValue({ jobs: [{ job_id: "done", project_id: projectId,
+      status: "completed", progress: 1, items: [], created_at: timestamp, updated_at: timestamp }],
+      queued: 0, running: 0 });
+    const pending = deferred<{ project_id: string; lines: Record<string, unknown> }>();
+    let reads = 0;
+    apiMocks.fetchManifest.mockImplementation(async () => ++reads === 1
+      ? { project_id: projectId, lines: {} } : pending.promise);
+    const view = await renderApp(projectId);
+    await flushAsync();
+    expect(reads).toBeGreaterThan(1);
+    pending.resolve({ project_id: projectId, lines: { line: { line_id: "line", versions: [{
+      version_id: "v001", engine: "gpt-sovits", profile: "default", status: "completed",
+      audio_path: "E:/test/done.wav", created_at: timestamp
+    }] } } });
+    await flushAsync(40);
+    expect(view.container.textContent).toContain("1 个版本");
+  });
+
+  it("publishes the final audio history after a delayed terminal manifest read", async () => {
+    const projectId = "terminal-manifest";
+    const project = scriptProject("音频历史刷新验收");
+    project.lines = [{ id: "line", character_id: "role", text: "最后一条音频", note: "", language: "zh-CN" }];
+    backendProjects.set(projectId, project);
+    const pendingManifest = deferred<{ project_id: string; lines: Record<string, unknown> }>();
+    let queueReads = 0;
+    apiMocks.fetchQueueStatus.mockImplementation(async () => ({
+      jobs: [{ job_id: "job-final", project_id: projectId, status: ++queueReads === 1 ? "running" : "completed",
+        progress: 1, items: [], created_at: timestamp, updated_at: timestamp }], queued: 0, running: queueReads === 1 ? 1 : 0
+    }));
+    let manifestReads = 0;
+    apiMocks.fetchManifest.mockImplementation(async () => ++manifestReads === 1
+      ? { project_id: projectId, lines: {} } : pendingManifest.promise);
+    const view = await renderApp(projectId);
+    await flushAsync();
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 650)); });
+    expect(manifestReads).toBeGreaterThan(1);
+    pendingManifest.resolve({ project_id: projectId, lines: { line: { line_id: "line", versions: [{
+      version_id: "v001", engine: "indextts", profile: "default", status: "completed",
+      audio_path: "E:/test/final.wav", created_at: timestamp
+    }] } } });
+    await flushAsync(40);
+    expect(view.container.textContent).toContain("1 个版本");
+  });
+
+  it("opens a successful historical run without submitting a new analysis", async () => {
+    const projectId = "history-open";
+    const revision = scriptRevision("history-revision", "九九：从历史恢复");
+    backendProjects.set(projectId, scriptProject("历史恢复验收", revision));
+    const run = completedRun(projectId, revision.revision_id);
+    apiMocks.fetchAnalysisRun.mockResolvedValue(run);
+    apiMocks.fetchAnalysisDraft.mockResolvedValue(analysisDraft(projectId, revision.revision_id));
+    apiMocks.fetchAnalysisHistory.mockResolvedValue({ runs: [{
+      run_id: run.id, draft_id: run.draft_id, project_id: projectId,
+      project_title: "历史恢复验收", source_revision_id: revision.revision_id,
+      status: "completed", progress: 1, error_code: null, created_at: timestamp, updated_at: timestamp
+    }] });
+    const view = await renderApp(projectId);
+    await flushAsync();
+    await click(view.container.querySelector('[data-action="analysis-history"]')!);
+    await flushAsync();
+    await click(view.container.querySelector('[aria-label="打开《历史恢复验收》的分析记录"]')!);
+    await flushAsync(40);
+    expect(view.container.querySelector(".script-analysis-workspace")).not.toBeNull();
+    expect(view.container.textContent).toContain("九九：从历史恢复");
+    expect(apiMocks.createAnalysisRun).not.toHaveBeenCalled();
+  });
+
   it("shows global analysis history and deletes records of any status", async () => {
     const projectId = "history-project";
     backendProjects.set(projectId, scriptProject("历史剧本"));

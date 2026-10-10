@@ -47,3 +47,7 @@ An unhealthy owned backend fails explicitly to avoid duplicate stateful schedule
 PowerShell 高级调用支持 `-ProjectRoot`、`-ComfyRoot`、三个端口参数、`-TimeoutSeconds`（默认 180 秒）、`-Mode check/plan/start`、`-NoBrowser`。`--plan` 不启动服务或改写配置；`--check` 检查必需文件与运行时依赖，不加载 TTS 模型。
 
 PID、就绪状态和实际地址写入 `data/local/run/tts-more.pid.json`；日志在 `data/local/run/one-click/`。前端代理自动使用实际后端端口。脚本文件保留 UTF-8 BOM，兼容 Windows PowerShell 5.1 的中文解析。
+
+当本机 Hugging Face 模型缓存已经完整、联网元数据请求较慢时，可在启动 ComfyUI 的环境中设置 `HF_HUB_OFFLINE=1` 和 `TRANSFORMERS_OFFLINE=1`。这只使用已有缓存；缺少模型时会明确失败。环境变量只在进程启动时生效，复用已存在实例不会改变它的环境。不要为了应用这些变量终止仍在生成的任务。
+
+With complete local model caches, optional offline variables avoid remote metadata requests. Missing assets fail explicitly. Reusing a running process preserves its original environment.

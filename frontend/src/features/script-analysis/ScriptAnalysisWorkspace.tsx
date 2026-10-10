@@ -37,6 +37,7 @@ export interface ScriptAnalysisWorkspaceProps {
   createUtteranceId?: () => string;
   copyDiagnostics?: (diagnostics: string) => void | Promise<void>;
   onDeleteAnalysisHistoryRequest?: (item: AnalysisHistoryItem) => Promise<boolean>;
+  onSelectAnalysisHistory?: (item: AnalysisHistoryItem) => Promise<void>;
 }
 
 export interface ConfirmableUtteranceSummary {
@@ -101,7 +102,8 @@ export function ScriptAnalysisWorkspace({
   createCharacterId,
   createUtteranceId = defaultCreateUtteranceId,
   copyDiagnostics,
-  onDeleteAnalysisHistoryRequest
+  onDeleteAnalysisHistoryRequest,
+  onSelectAnalysisHistory
 }: ScriptAnalysisWorkspaceProps) {
   const { t, i18n } = useTranslation();
   const controller = useAnalysisDraft(projectId, sourceRevision, controllerOptions);
@@ -299,6 +301,12 @@ export function ScriptAnalysisWorkspace({
         <div className="script-analysis-workspace__topbar-actions">
           {onDeleteAnalysisHistoryRequest ? (
             <AnalysisHistoryDropdown
+              onSelect={onSelectAnalysisHistory ? async (item) => {
+                if (controller.pendingOperationBatches > 0) {
+                  throw new Error(t("analysis.save.pending", { count: controller.pendingOperationBatches }));
+                }
+                await onSelectAnalysisHistory(item);
+              } : undefined}
               onDeleteRequest={onDeleteAnalysisHistoryRequest}
               onDeleted={(item) => {
                 if (item.run_id === controller.run?.id) onCancel();

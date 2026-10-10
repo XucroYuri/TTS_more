@@ -206,6 +206,11 @@ export function useAnalysisDraft(
   const [analysisRetry, setAnalysisRetry] = useState(0);
 
   const lifecycleEpochRef = useRef(0);
+  const creationInFlightRef = useRef<{
+    scopeId: string;
+    api: AnalysisDraftApi;
+    promise: ReturnType<AnalysisDraftApi["createAnalysisRun"]>;
+  } | null>(null);
   const queueGenerationRef = useRef(0);
   const runRef = useRef<AnalysisRun | null>(null);
   const serverDraftRef = useRef<SemanticAnalysisDraft | null>(null);
@@ -413,13 +418,22 @@ export function useAnalysisDraft(
         return;
       }
       setIsRunning(true);
+      let creation = creationInFlightRef.current;
       try {
-        const created = await api.createAnalysisRun(projectId, sourceRevision.revision_id);
+        // StrictMode replays effects while the first POST is still in flight.
+        // Attach both lifecycles to that request rather than creating two runs.
+        if (!creation || creation.scopeId !== scopeId || creation.api !== api) {
+          creation = { scopeId, api, promise: api.createAnalysisRun(projectId, sourceRevision.revision_id) };
+          creationInFlightRef.current = creation;
+        }
+        const created = await creation.promise;
+        if (creationInFlightRef.current === creation) {
+          writeAnalysisRunSession(storage, scopeId, {
+            runId: created.run_id,
+            draftId: created.draft_id
+          });
+        }
         if (!active()) return;
-        writeAnalysisRunSession(storage, scopeId, {
-          runId: created.run_id,
-          draftId: created.draft_id
-        });
         const record = await api.fetchAnalysisRun(created.run_id);
         if (!active()) return;
         await acceptRun(record, created.draft_id);
@@ -427,6 +441,8 @@ export function useAnalysisDraft(
         if (!active()) return;
         setIsRunning(false);
         setControllerErrorState(controllerError("create", error));
+      } finally {
+        if (creationInFlightRef.current === creation) creationInFlightRef.current = null;
       }
     };
 

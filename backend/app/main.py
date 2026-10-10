@@ -1869,17 +1869,21 @@ def _load_service_registry(path: Path) -> ServiceRegistry:
 
 
 def _apply_registry(app: FastAPI, registry: ServiceRegistry, store: ProjectStore) -> None:
-    """Rebuild router/queue/job_manager from a (possibly updated) registry.
+    """Update routing while retaining jobs and shared resource arbitration.
 
     Called after every mutation of the service registry (save settings, reload,
     open-source configure) to keep the routing layer in sync.
     """
     router = ServiceRouter(registry)
-    queue = ServiceGenerationQueue(router)
+    queue = getattr(app.state, "queue", None)
+    if queue is None:
+        queue = ServiceGenerationQueue(router)
+        app.state.job_manager = GenerationJobManager(queue, store)
+    else:
+        queue.router = router
     app.state.service_registry = registry
     app.state.service_router = router
     app.state.queue = queue
-    app.state.job_manager = GenerationJobManager(queue, store)
     if hasattr(app.state, "voice_catalog"):
         app.state.voice_catalog.registry = registry
         app.state.voice_catalog.clients = router.clients

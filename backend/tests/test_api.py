@@ -390,8 +390,9 @@ def test_parser_provider_test_posts_kwjm_root_to_v1_chat_completions(monkeypatch
             }
 
     class FakeClient:
-        def __init__(self, *, timeout: float) -> None:
+        def __init__(self, *, timeout: float, trust_env: bool) -> None:
             captured["timeout"] = timeout
+            captured["trust_env"] = trust_env
 
         def __enter__(self) -> "FakeClient":
             return self
@@ -428,6 +429,7 @@ def test_parser_provider_test_posts_kwjm_root_to_v1_chat_completions(monkeypatch
     assert response.status_code == 200
     assert response.json()["ok"] is True
     assert captured["url"] == "https://kwjm.com/v1/chat/completions"
+    assert captured["trust_env"] is True
     assert captured["headers"] == {"Authorization": "Bearer kwjm-test-secret", "Content-Type": "application/json"}
     assert captured["json"]["model"] == "gpt-5.5"
     messages = captured["json"]["messages"]
@@ -469,8 +471,9 @@ def test_parser_provider_test_uses_anthropic_adapter(monkeypatch, tmp_path: Path
             }
 
     class FakeClient:
-        def __init__(self, *, timeout: float) -> None:
+        def __init__(self, *, timeout: float, trust_env: bool) -> None:
             captured["timeout"] = timeout
+            captured["trust_env"] = trust_env
 
         def __enter__(self) -> "FakeClient":
             return self
@@ -507,6 +510,7 @@ def test_parser_provider_test_uses_anthropic_adapter(monkeypatch, tmp_path: Path
     assert response.status_code == 200
     assert response.json()["ok"] is True
     assert captured["url"] == "https://api.anthropic.com/v1/messages"
+    assert captured["trust_env"] is True
     assert captured["headers"]["x-api-key"] == "anthropic-test-secret"
     assert captured["json"]["tool_choice"] == {"type": "tool", "name": "emit_tts_parse"}
 

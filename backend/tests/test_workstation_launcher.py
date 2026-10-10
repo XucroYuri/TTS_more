@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from app.main import create_app
+from app.main import create_app, _apply_registry
 from app.service_store_io import ServiceDocument
 from app.comfyui.workflow_builder import build_indextts_workflow
 
@@ -24,6 +24,26 @@ spec = importlib.util.spec_from_file_location("launch_services", ROOT / "scripts
 assert spec and spec.loader
 launch_services = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(launch_services)
+
+
+def test_registry_reload_preserves_jobs_and_resource_arbitration(tmp_path, monkeypatch):
+    services = tmp_path / "services.json"
+    services.write_text("[]", encoding="utf-8")
+    monkeypatch.delenv("TTS_MORE_API_TOKEN", raising=False)
+    app = create_app(data_root=tmp_path, services_path=services)
+    queue = app.state.queue
+    manager = app.state.job_manager
+    semaphore = queue._resource_semaphore("gpu", capacity=1)
+    marker = object()
+    manager._jobs["ongoing"] = marker
+    router = app.state.service_router
+    _apply_registry(app, app.state.service_registry, manager.store)
+    assert app.state.job_manager is manager
+    assert manager._jobs["ongoing"] is marker
+    assert app.state.queue is queue
+    assert queue._resource_semaphore("gpu", capacity=1) is semaphore
+    assert queue.router is app.state.service_router
+    assert queue.router is not router
 
 
 def test_readiness_does_not_probe_model_workers(tmp_path, monkeypatch):

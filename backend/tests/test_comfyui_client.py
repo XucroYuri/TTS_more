@@ -455,6 +455,26 @@ class TestComfyUIAPIClient:
             assert "outputs" in result
             assert result["outputs"]["4"]["audio"][0]["filename"] == "tts_more_cosyvoice_00001.flac"
 
+    def test_poll_reports_actual_queue_state(self):
+        count = 0
+        states = []
+
+        def handler(request):
+            nonlocal count
+            if "/history/" in request.url.path:
+                count += 1
+                return httpx.Response(200, json={"p": {"outputs": {"1": {}}}} if count == 3 else {})
+            if request.url.path == "/queue":
+                return httpx.Response(200, json={
+                    "queue_pending": [[0, "p"]] if count == 1 else [],
+                    "queue_running": [[0, "p"]] if count == 2 else [],
+                })
+            return httpx.Response(404)
+
+        api = ComfyUIAPIClient("http://127.0.0.1:8188", transport=httpx.MockTransport(handler))
+        api.poll_until_done("p", poll_interval=0, max_wait=5, state_callback=states.append)
+        assert states == ["queued", "running"]
+
     def test_poll_until_done_cancels_prompt_when_requested(self, monkeypatch):
         client = ComfyUIAPIClient("http://127.0.0.1:8188")
         history_calls: list[str] = []
@@ -1111,6 +1131,7 @@ class TestComfyUITTSClient:
             max_wait: float,
             *,
             cancel_check,
+            state_callback=None,
         ):
             assert poll_interval == 2.0
             assert max_wait == 1.0

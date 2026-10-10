@@ -154,6 +154,7 @@ export function buildConfirmedAnalysisHandoff(
 }
 
 export interface AnalysisStageGateProps {
+  sessionKey?: string;
   stage: WorkspaceStage;
   projectId: string | null;
   sourceRevision: ScriptRevision | null;
@@ -161,10 +162,12 @@ export interface AnalysisStageGateProps {
   onCancel: () => void;
   controllerOptions?: UseAnalysisDraftOptions;
   onDeleteAnalysisHistoryRequest?: (item: AnalysisHistoryItem) => Promise<boolean>;
+  onSelectAnalysisHistory?: (item: AnalysisHistoryItem) => Promise<void>;
   ttsWorkbench: ReactNode;
 }
 
 export function AnalysisStageGate({
+  sessionKey,
   stage,
   projectId,
   sourceRevision,
@@ -172,17 +175,19 @@ export function AnalysisStageGate({
   onCancel,
   controllerOptions,
   onDeleteAnalysisHistoryRequest,
+  onSelectAnalysisHistory,
   ttsWorkbench
 }: AnalysisStageGateProps) {
   if (stage === "analysis" && projectId && sourceRevision) {
     return createElement(ScriptAnalysisWorkspace, {
-      key: `${projectId}:${sourceRevision.revision_id}:${sourceRevision.source_sha256 ?? ""}`,
+      key: `${projectId}:${sourceRevision.revision_id}:${sourceRevision.source_sha256 ?? ""}:${sessionKey ?? ""}`,
       projectId,
       sourceRevision,
       onConfirmed,
       onCancel,
       controllerOptions,
-      onDeleteAnalysisHistoryRequest
+      onDeleteAnalysisHistoryRequest,
+      onSelectAnalysisHistory
     });
   }
   return createElement(Fragment, null, ttsWorkbench);

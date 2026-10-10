@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
@@ -346,6 +346,7 @@ class ComfyUIAPIClient:
         *,
         cancel_check: SynthesisCancelCheck | None = None,
         cancel_wait: float = 30.0,
+        state_callback: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
         deadline = time.monotonic() + max_wait
 
@@ -401,6 +402,16 @@ class ComfyUIAPIClient:
                     return entry
                 if status.get("completed") is True:
                     raise RuntimeError("ComfyUI prompt failed: no output")
+            if state_callback is not None:
+                try:
+                    state = self._queue_state(self.get_queue(), prompt_id)
+                    if state == "pending":
+                        state = "queued"
+                    if state in {"queued", "running"}:
+                        state_callback(state)
+                except Exception:
+                    # Progress is best effort; history remains authoritative.
+                    pass
             sleep_deadline = min(
                 deadline,
                 time.monotonic() + max(0.0, poll_interval),

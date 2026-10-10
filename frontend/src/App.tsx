@@ -32,6 +32,8 @@ import {
   clearVoiceSelection,
   fetchCharacters,
   fetchAnalysisReviewSession,
+  fetchAnalysisRun,
+  fetchAnalysisDraft,
   fetchProjectCharacters,
   fetchManifest,
   fetchGptSovitsModelCatalog,
@@ -356,6 +358,7 @@ export default function App() {
   const currentProjectIdRef = useRef<string | null>(currentProjectId);
   const analysisProjectIdRef = useRef<string | null>(null);
   const analysisConfirmedReviewRef = useRef(false);
+  const [analysisHistoryRunId, setAnalysisHistoryRunId] = useState("");
   const analysisManagedProjectIdRef = useRef<string | null>(managedProjectId);
   const analysisCurrentProjectIdRef = useRef<string | null>(currentProjectId);
   const analysisSourceFileMetadataRef = useRef<AnalysisSourceFileMetadata | null>(null);
@@ -527,7 +530,8 @@ export default function App() {
         const fallbackRevision = fallbackProject.script_revisions?.find(
           (revision) => revision.revision_id === fallbackProject.active_script_revision_id
         );
-        if (fallbackRevision && hasRestorableAnalysisSession(fallbackProjectId, fallbackRevision)) {
+        if (fallbackRevision && !fallbackProject.active_parse_revision_id
+          && hasRestorableAnalysisSession(fallbackProjectId, fallbackRevision)) {
           analysisProjectIdRef.current = fallbackProjectId;
           setAnalysisSourceRevision(fallbackRevision);
           setWorkspaceStage("analysis");
@@ -613,6 +617,7 @@ export default function App() {
         );
         if (
           !readActiveAnalysisScope()
+          && !payload.active_parse_revision_id
           && resumableRevision
           && hasRestorableAnalysisSession(currentProjectId, resumableRevision)
         ) {
@@ -1151,12 +1156,15 @@ export default function App() {
       try {
         const nextQueue = await fetchQueueStatus();
         if (disposed) return;
-        setQueueStatus(nextQueue);
         keepPolling = nextQueue.jobs.some((job) => !isTerminalGenerationStatus(job.status));
         if (currentProjectId && nextQueue.jobs.some((job) => job.project_id === currentProjectId)) {
-          const nextManifest = await fetchManifest(currentProjectId).catch(() => null);
-          if (!disposed && nextManifest) setManifest(nextManifest);
+          const nextManifest = await fetchManifest(currentProjectId);
+          if (disposed) return;
+          setManifest(nextManifest);
         }
+        // Publishing the terminal queue tears down this effect. Finish the
+        // matching manifest read first, and retry it if that read fails.
+        if (!disposed) setQueueStatus(nextQueue);
       } catch {
         keepPolling = true;
       } finally {
@@ -1301,6 +1309,11 @@ export default function App() {
       setServices(mergeServiceRecords(settingsPayload.services, servicePayload.services).filter((service) => !isUnsupportedLocalVibeVoice(service)));
       setRuntime(runtimePayload);
       setVoiceCandidates(candidatePayload);
+      const manifestProjectId = currentProjectIdRef.current;
+      if (manifestProjectId && queuePayload?.jobs.some((job) => job.project_id === manifestProjectId)) {
+        const nextManifest = await fetchManifest(manifestProjectId);
+        if (currentProjectIdRef.current === manifestProjectId) setManifest(nextManifest);
+      }
       setQueueStatus(queuePayload);
     } finally {
       setIsRefreshingTopology(false);
@@ -2400,6 +2413,31 @@ export default function App() {
     }
   }
 
+  async function openAnalysisHistory(item: AnalysisHistoryItem) {
+    const operationToken = ++analysisStartOperationTokenRef.current;
+    const currentId = analysisCurrentProjectIdRef.current;
+    if (currentId) await flushPendingProjectAutosave(currentId);
+    const [target, run, draft] = await Promise.all([
+      fetchProject(item.project_id), fetchAnalysisRun(item.run_id), fetchAnalysisDraft(item.draft_id)
+    ]);
+    if (analysisStartOperationTokenRef.current !== operationToken
+      || analysisCurrentProjectIdRef.current !== currentId) return;
+    const revision = target.script_revisions?.find((candidate) => candidate.revision_id === item.source_revision_id);
+    if (!revision || run.project_id !== item.project_id || run.draft_id !== item.draft_id
+      || run.source_revision_id !== revision.revision_id || draft.id !== item.draft_id
+      || draft.project_id !== item.project_id || draft.source_revision_id !== revision.revision_id) {
+      throw new Error(t("app.analysisResultUnavailable"));
+    }
+    writeAnalysisRunSession(defaultAnalysisStorage(), analysisScopeStorageId(item.project_id, revision),
+      { runId: item.run_id, draftId: item.draft_id });
+    writeActiveAnalysisScope(item.project_id, revision);
+    analysisProjectIdRef.current = item.project_id;
+    analysisConfirmedReviewRef.current = false;
+    setAnalysisHistoryRunId(item.run_id);
+    setAnalysisSourceRevision(revision);
+    setWorkspaceStage("analysis");
+  }
+
   async function saveManagedScriptRevision() {
     if (!managedProjectId || !managedProject) return;
     const title = managerTitleDraft.trim();
@@ -2787,6 +2825,7 @@ export default function App() {
         )}
       >
         <AnalysisStageGate
+          sessionKey={analysisHistoryRunId}
           stage={workspaceStage}
           projectId={analysisProjectIdRef.current}
           sourceRevision={analysisSourceRevision}
@@ -2796,6 +2835,7 @@ export default function App() {
             mode: analysisConfirmedReviewRef.current ? "review" : "analyze"
           }}
           onDeleteAnalysisHistoryRequest={confirmAnalysisHistoryDeletion}
+          onSelectAnalysisHistory={openAnalysisHistory}
           ttsWorkbench={(
             <>
         <header className="topbar">
@@ -2813,6 +2853,7 @@ export default function App() {
               <span className="menu-trigger-label">{t("app.reviewConfirmedAnnotations")}</span>
             </button>
             <AnalysisHistoryDropdown
+              onSelect={openAnalysisHistory}
               onOpen={() => setIsTopologyMenuOpen(false)}
               onDeleteRequest={confirmAnalysisHistoryDeletion}
             />

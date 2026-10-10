@@ -2027,6 +2027,10 @@ class ComfyUITTSClient:
             poll_interval = float(params.get("poll_interval", 2.0))
             cancelling_emitted = False
 
+            def report_prompt_state(state: str) -> None:
+                if not cancelling_emitted:
+                    self._emit_prompt_progress(request, prompt_id, state, 0.1)
+
             def cancel_check_with_progress() -> bool:
                 nonlocal cancelling_emitted
                 if request.cancel_check is None or not request.cancel_check():
@@ -2045,6 +2049,7 @@ class ComfyUITTSClient:
                     if request.cancel_check is not None
                     else None
                 ),
+                state_callback=report_prompt_state if request.progress_callback is not None else None,
             )
             prompt_converged = True
             output_files = self.api._extract_output_filenames(history_entry)

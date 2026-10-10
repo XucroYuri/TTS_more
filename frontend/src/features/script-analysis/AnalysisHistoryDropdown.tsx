@@ -8,6 +8,7 @@ import { defaultAnalysisStorage, removeDeletedAnalysisSession } from "./analysis
 
 interface AnalysisHistoryDropdownProps {
   onOpen?: () => void;
+  onSelect?: (item: AnalysisHistoryItem) => Promise<void>;
   onDeleteRequest: (item: AnalysisHistoryItem) => Promise<boolean>;
   onDeleted?: (item: AnalysisHistoryItem) => void;
 }
@@ -36,13 +37,14 @@ function formatAnalysisTime(value: string, language: string): string {
   }).format(date);
 }
 
-export function AnalysisHistoryDropdown({ onOpen, onDeleteRequest, onDeleted }: AnalysisHistoryDropdownProps) {
+export function AnalysisHistoryDropdown({ onOpen, onSelect, onDeleteRequest, onDeleted }: AnalysisHistoryDropdownProps) {
   const { t, i18n } = useTranslation();
   const [open, setOpen] = useState(false);
   const [items, setItems] = useState<AnalysisHistoryItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [deletingRunId, setDeletingRunId] = useState<string | null>(null);
   const [error, setError] = useState("");
+  const [openingRunId, setOpeningRunId] = useState<string | null>(null);
   const wrapperRef = useRef<HTMLDivElement | null>(null);
 
   const loadHistory = useCallback(async (showLoading = true) => {
@@ -97,6 +99,20 @@ export function AnalysisHistoryDropdown({ onOpen, onDeleteRequest, onDeleted }: 
     }
   }
 
+  async function openItem(item: AnalysisHistoryItem) {
+    if (!onSelect) return;
+    setOpeningRunId(item.run_id);
+    setError("");
+    try {
+      await onSelect(item);
+      setOpen(false);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : t("analysisHistory.loadFailed"));
+    } finally {
+      setOpeningRunId(null);
+    }
+  }
+
   return (
     <div className="topbar-menu-wrap analysis-history-wrap" ref={wrapperRef}>
       <button
@@ -146,7 +162,13 @@ export function AnalysisHistoryDropdown({ onOpen, onDeleteRequest, onDeleted }: 
                 return (
                   <article className="analysis-history-row" key={item.run_id}>
                     <div className="analysis-history-script" title={item.project_title}>
-                      <strong>{item.project_title}</strong>
+                      {onSelect ? (
+                        <button type="button" className="text-button" disabled={openingRunId !== null}
+                          aria-label={t("analysisHistory.openItem", { title: item.project_title })}
+                          onClick={() => void openItem(item)}>
+                          {openingRunId === item.run_id ? <Loader2 className="spin" size={14} /> : item.project_title}
+                        </button>
+                      ) : <strong>{item.project_title}</strong>}
                       <span>{item.source_revision_id}</span>
                     </div>
                     <time dateTime={item.created_at}>{formatAnalysisTime(item.created_at, i18n.language)}</time>
